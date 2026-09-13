@@ -1,3 +1,9 @@
+## [0.187.2](https://github.com/nanobpm/nano-workforce/compare/v0.187.1...v0.187.2) (2026-09-13)
+
+### Bug Fixes
+
+* **convergence:** key suppressed-advisory acks on line-stable identity ([#788](https://github.com/nanobpm/nano-workforce/issues/788)) ([9b9d124](https://github.com/nanobpm/nano-workforce/commit/9b9d1241dbd725cfe9b8ac88f5a9f5b949dc4fc4)), closes [#787](https://github.com/nanobpm/nano-workforce/issues/787) [#787](https://github.com/nanobpm/nano-workforce/issues/787) [pre-#787](https://github.com/nanobpm/pre-/issues/787) [#787](https://github.com/nanobpm/nano-workforce/issues/787)
+
 ## [0.187.1](https://github.com/nanobpm/nano-workforce/compare/v0.187.0...v0.187.1) (2026-09-12)
 
 ### Bug Fixes
