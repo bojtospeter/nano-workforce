@@ -1,3 +1,9 @@
+## [0.187.4](https://github.com/nanobpm/nano-workforce/compare/v0.187.3...v0.187.4) (2026-09-14)
+
+### Bug Fixes
+
+* raise default review-wait timeout to PT30M ([#792](https://github.com/nanobpm/nano-workforce/issues/792)) ([042573d](https://github.com/nanobpm/nano-workforce/commit/042573dc5e691dc97efebc12da6a63f2cf398c2a)), closes [#783](https://github.com/nanobpm/nano-workforce/issues/783) [#791](https://github.com/nanobpm/nano-workforce/issues/791)
+
 ## [0.187.3](https://github.com/nanobpm/nano-workforce/compare/v0.187.2...v0.187.3) (2026-09-14)
 
 ### Bug Fixes
