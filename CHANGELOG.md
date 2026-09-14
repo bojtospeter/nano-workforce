@@ -1,3 +1,9 @@
+## [0.187.3](https://github.com/nanobpm/nano-workforce/compare/v0.187.2...v0.187.3) (2026-09-14)
+
+### Bug Fixes
+
+* pr-escalation Tasks form no longer renders a blank question field ([#785](https://github.com/nanobpm/nano-workforce/issues/785)) ([eb6bc0e](https://github.com/nanobpm/nano-workforce/commit/eb6bc0e9a677effed0e4d93a3c37033f7819d943)), closes [#767](https://github.com/nanobpm/nano-workforce/issues/767)
+
 ## [0.187.2](https://github.com/nanobpm/nano-workforce/compare/v0.187.1...v0.187.2) (2026-09-13)
 
 ### Bug Fixes
