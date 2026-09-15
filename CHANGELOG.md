@@ -1,3 +1,9 @@
+## [0.187.5](https://github.com/nanobpm/nano-workforce/compare/v0.187.4...v0.187.5) (2026-09-15)
+
+### Bug Fixes
+
+* **convergence:** classify husked review rounds and bound-retry the no-progress loop ([#789](https://github.com/nanobpm/nano-workforce/issues/789)) ([faebcdc](https://github.com/nanobpm/nano-workforce/commit/faebcdcaca017fab8d7436a50e3dc09354dc3022)), closes [jwulf/c8ctl-plugin-nano#230](https://github.com/jwulf/c8ctl-plugin-nano/issues/230) [#786](https://github.com/nanobpm/nano-workforce/issues/786) [#786](https://github.com/nanobpm/nano-workforce/issues/786)
+
 ## [0.187.4](https://github.com/nanobpm/nano-workforce/compare/v0.187.3...v0.187.4) (2026-09-14)
 
 ### Bug Fixes
