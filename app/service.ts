@@ -798,7 +798,7 @@ export async function activePrs(data: DataLayer): Promise<ActivePr[]> {
  * fresh-review detection + Copilot nudge below stay here because review freshness is inherently
  * STATEFUL (keyed off `last_review_id`/`waiting_since`), which the stateless probe matchers cannot
  * subsume — the poller owns the forward-progress guarantee, the gate owns the bounded wait. */
-async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
+export async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
   const waiting = await prs(data).find({ status: "waiting_review" });
   for (const pr of waiting) {
     const { repo, number, pr_key: prKey } = pr;
