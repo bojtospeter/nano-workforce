@@ -60,66 +60,17 @@ function isGhAvailable(): Promise<boolean> {
   return ghAvailable;
 }
 
-const MAX_REVIEW_PAGE_HOPS = 100;
-
-interface ReviewPage {
-  reviews: GhReview[];
-  link: string | null;
-}
-
-/** Find a URL for a relation in GitHub's REST Link header. */
-function linkedPage(link: string | null, relation: "last" | "next"): string | null {
-  if (!link) return null;
-  for (const part of link.split(/,\s*(?=<)/)) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="([^"]+)"/i);
-    if (match?.[2].split(/\s+/).includes(relation)) return match[1];
-  }
-  return null;
-}
-
-function parseReviewPayload(parsed: unknown): GhReview[] {
-  if (!Array.isArray(parsed)) throw new Error("github reviews response was not an array");
-  // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-  return parsed as GhReview[];
-}
-
-function parseReviewPage(body: string): GhReview[] {
-  return parseReviewPayload(JSON.parse(body));
+function lastReviewPage(link: string | null): string | null {
+  return link?.match(/<([^>]+)>\s*;\s*rel="last"/i)?.[1] ?? null;
 }
 
 /** `gh api --include` prefixes the JSON body with the HTTP status line and headers. */
-function parseGhReviewPage(output: string): ReviewPage {
-  const separator = /\r?\n\r?\n/.exec(output);
-  if (!separator || separator.index === undefined) {
-    throw new Error("github gh response did not include HTTP headers");
-  }
-  const headerBlock = output.slice(0, separator.index);
-  const linkLine = headerBlock.split(/\r?\n/).find((line) => /^link\s*:/i.test(line));
-  return {
-    reviews: parseReviewPage(output.slice(separator.index + separator[0].length)),
-    link: linkLine?.replace(/^link\s*:\s*/i, "").trim() ?? null,
-  };
-}
-
-/** Read the final REST page without downloading the complete review history. */
-async function fetchFinalReviewPage(
-  firstUrl: string,
-  fetchPage: (url: string) => Promise<ReviewPage>,
-): Promise<GhReview[]> {
-  let url = firstUrl;
-  let page = await fetchPage(url);
-  for (let hop = 0; ; hop++) {
-    const last = linkedPage(page.link, "last");
-    if (last && last !== url) return (await fetchPage(last)).reviews;
-
-    const next = linkedPage(page.link, "next");
-    if (!next) return page.reviews;
-    if (next === url || hop >= MAX_REVIEW_PAGE_HOPS) {
-      throw new Error(`github reviews pagination exceeded ${MAX_REVIEW_PAGE_HOPS} page hops`);
-    }
-    url = next;
-    page = await fetchPage(url);
-  }
+function parseGhReviewPage(output: string): { reviews: GhReview[]; last: string | null } {
+  const [headers, body] = output.split(/\r?\n\r?\n/, 2);
+  if (body === undefined) throw new Error("github gh response did not include HTTP headers");
+  const link = headers.split(/\r?\n/).find((line) => /^link\s*:/i.test(line));
+  // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
+  return { reviews: JSON.parse(body) as GhReview[], last: lastReviewPage(link ?? null) };
 }
 
 /** Fetch the reviews for one PR via the configured transport. Throws on transport failure so
@@ -133,20 +84,22 @@ export async function fetchPrReviews(
   const useGh = mode === "gh" || (mode === "auto" && (await isGhAvailable()));
   const path = `repos/${repo}/pulls/${number}/reviews?per_page=100`;
   if (useGh) {
-    return fetchFinalReviewPage(path, async (url) =>
-      parseGhReviewPage(
-        await runGh(["api", url, "--include", "-H", "Accept: application/vnd.github+json"]),
-      ),
-    );
+    const readPage = async (url: string) =>
+      parseGhReviewPage(await runGh(["api", url, "--include", "-H", "Accept: application/vnd.github+json"]));
+    const first = await readPage(path);
+    return first.last ? (await readPage(first.last)).reviews : first.reviews;
   }
   if (!token) return null; // token mode with no token → poller idles
-  return fetchFinalReviewPage(`https://api.github.com/${path}`, async (url) => {
+  const readPage = async (url: string) => {
     const r = await fetch(url, {
       headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" },
     });
     if (!r.ok) throw new Error(`github ${r.status} ${r.statusText}`.trim());
-    return { reviews: parseReviewPayload(await r.json()), link: r.headers.get("link") };
-  });
+    // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
+    return { reviews: (await r.json()) as GhReview[], last: lastReviewPage(r.headers.get("link")) };
+  };
+  const first = await readPage(`https://api.github.com/${path}`);
+  return first.last ? (await readPage(first.last)).reviews : first.reviews;
 }
 
 // ── Review-comment convergence gate (don't converge with unaddressed comments) ──────────────
