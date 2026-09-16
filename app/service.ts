@@ -26,6 +26,7 @@ import {
   CONFORMANCE_ESCALATION_ELEMENT,
   conformanceEscalationQuestion,
 } from "./conformance.ts";
+import { makeDefaultReadHead } from "./currentHead.ts";
 import { isUniqueConstraintFence } from "./dbFence.ts";
 import { deriveDelivery, EPIC_LIVE_STATUSES, TERMINAL_STATUSES } from "./delivery.ts";
 import { sweepExpiredProposals } from "./deliveryGraphProposals.ts";
@@ -40,6 +41,7 @@ import {
   coalesceTitle,
   ensureFreshHeadRun,
   ensurePromotionPr,
+  fetchBranchHead,
   fetchDefaultBranch,
   fetchPrHead,
   fetchPrMeta,
@@ -91,7 +93,7 @@ import {
 // (submitPr/startMerge) and re-exported below so the long-standing `import { repoEnvelopeVars } from
 // "./service.ts"` call sites (and its tests) keep resolving.
 import { repoEnvelopeVars } from "./repoEnvelope.ts";
-import { clampNudgeMinutes, reviewWaitTimeout } from "./reviewWait.ts";
+import { clampNudgeMinutes, isReviewStale, reviewWaitTimeout } from "./reviewWait.ts";
 import { trialMergeAudits } from "./trialMerge.ts";
 import {
   buildUserTaskRow,
@@ -833,7 +835,12 @@ export async function activePrs(data: DataLayer): Promise<ActivePr[]> {
  * fresh-review detection + Copilot nudge below stay here because review freshness is inherently
  * STATEFUL (keyed off `last_review_id`/`waiting_since`), which the stateless probe matchers cannot
  * subsume — the poller owns the forward-progress guarantee, the gate owns the bounded wait. */
-async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
+// The poller's PR current-head reader — the SAME branch-ref-preferring reader the converge-gate and
+// progress-check bind (#786/#799), so the poller's stale-review detection sees the exact head those
+// steps do. Fails OPEN to `null` (unreadable head → not stale, per `isReviewStale`).
+const readCurrentHead = makeDefaultReadHead({ fetchPrHead, fetchBranchHead });
+
+export async function pollReviews(data: DataLayer, engine: EngineClient, token: string) {
   const waiting = await prs(data).find({ status: "waiting_review" });
   for (const pr of waiting) {
     const { repo, number, pr_key: prKey } = pr;
@@ -851,6 +858,34 @@ async function pollReviews(data: DataLayer, engine: EngineClient, token: string)
         // No fresh review yet. Copilot won't re-review a round with no new commit and dismisses
         // re-requests, so actively (re-)solicit the next review — throttled to one attempt per
         // REVIEW_NUDGE_MS window. The process's timer arm is the backstop if this never lands.
+        await maybeRerequestReview(data, pr, token);
+        continue;
+      }
+      // #799 (FM2): only resume the loop on a review of the CURRENT head. If the PR HEAD has
+      // advanced past the commit the newest review was submitted against, that review is STALE — its
+      // advisories describe code the head has moved past (e.g. an advisory the agent already fixed in
+      // a later commit). Publishing `readiness-ready` on it would resume the loop on obsolete
+      // findings and, at the converge-gate, re-escalate a human on an already-fixed advisory (PR
+      // #789). Treat a stale review like "no fresh review": (re-)solicit a fresh review of the
+      // current head and wait — without bumping `last_review_id`, so the next HEAD-current review is
+      // still detected. The head read fails OPEN (null → not stale), so a transport hiccup never
+      // strands a genuine review; the review-wait timer remains the backstop.
+      //
+      // Read the head via the SHARED branch-ref-preferring reader (`makeDefaultReadHead`, #786) — the
+      // exact reader the converge-gate uses — NOT `fetchPrHead(...).headSha` directly: the PR object's
+      // `head.sha` is an asynchronously-denormalized projection that can still equal `fresh.commit_id`
+      // right after a push, which would make the poller advance `last_review_id` on a stale review the
+      // gate would then classify stale, wedging the loop. Using the atomic branch ref makes the poller
+      // detect the same stale-head case the gate does.
+      // Read the head with the SAME per-call token the review fetch above uses (#799) — NOT the
+      // env-token default `makeDefaultReadHead` would otherwise fall back to. A caller that supplies
+      // a `token` without also setting GITHUB_TOKEN would otherwise get a `null` head here, which
+      // `isReviewStale` treats as not-stale (fails OPEN) and would advance `last_review_id` /
+      // publish readiness on a genuinely stale review. Passing `token` keeps both reads on one
+      // credential so the stale guard sees the real head.
+      const headSha = await readCurrentHead(repo, number, token).catch(() => null);
+      if (isReviewStale(fresh.commit_id, headSha)) {
+        console.log(`[poller] review ${fresh.id} is stale (predates HEAD) -> re-soliciting ${prKey}`);
         await maybeRerequestReview(data, pr, token);
         continue;
       }

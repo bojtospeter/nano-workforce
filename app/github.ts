@@ -23,6 +23,10 @@ export interface GhReview {
   id: number;
   state: string;
   submitted_at?: string;
+  /** The commit SHA the review was submitted against (GitHub's `commit_id`). Used to detect a
+   * review that predates the PR's current HEAD — a STALE review whose advisories are about code the
+   * head has since moved past (issue #799). Absent on data GitHub did not carry a `commit_id` for. */
+  commit_id?: string | null;
 }
 
 export type GithubTransport = "gh" | "token" | "auto";
@@ -61,7 +65,12 @@ function isGhAvailable(): Promise<boolean> {
 }
 
 /** Fetch the reviews for one PR via the configured transport. Throws on transport failure so
- * the caller can log-and-continue; returns `null` when no transport is usable (idle). */
+ * the caller can log-and-continue; returns `null` when no transport is usable (idle). Pages the
+ * FULL (oldest→newest) reviews list — the poller picks the newest fresh review by id, so reading
+ * only the first `per_page=100` page would, on a >100-review convergence loop, surface the OLDEST
+ * 100 and miss the genuinely newest review (repeatedly nudging while a current-head review sits on a
+ * later page, or classifying an old review as stale). This mirrors {@link fetchLatestCopilotReview}'s
+ * paging so both readers agree on which review is newest. */
 export async function fetchPrReviews(
   repo: string,
   number: number | string,
@@ -71,17 +80,43 @@ export async function fetchPrReviews(
   const useGh = mode === "gh" || (mode === "auto" && (await isGhAvailable()));
   const path = `repos/${repo}/pulls/${number}/reviews?per_page=100`;
   if (useGh) {
-    const out = await runGh(["api", path, "-H", "Accept: application/vnd.github+json"]);
+    // `--paginate --slurp` walks EVERY page of the (oldest→newest) reviews array, so a >100-review
+    // convergence loop still surfaces the genuinely newest review rather than the oldest 100. Plain
+    // `--paginate` concatenates one JSON array PER PAGE (multiple documents) which `JSON.parse`
+    // cannot read; `--slurp` wraps the pages in an outer array we flatten one level (mirrors
+    // {@link githubReleasesCommand}/{@link parseReleases}).
+    const out = await runGh([
+      "api", "--paginate", "--slurp", path, "-H", "Accept: application/vnd.github+json",
+    ]);
     // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-    return JSON.parse(out) as GhReview[];
+    return (JSON.parse(out) as GhReview[][]).flat();
   }
   if (!token) return null; // token mode with no token → poller idles
-  const r = await fetch(`https://api.github.com/${path}`, {
-    headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" },
-  });
-  if (!r.ok) throw new Error(`github ${r.status} ${r.statusText}`.trim());
-  // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-  return (await r.json()) as GhReview[];
+  // Page the token transport the same way; 20×100 reviews is far past any real convergence loop, and
+  // a genuinely deeper history we can't reach is unverifiable → fail CLOSED (throw) rather than
+  // return a partial list the poller would treat as complete (selecting an older review, re-nudging).
+  const reviews: GhReview[] = [];
+  const MAX_PAGES = 20;
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const r = await fetch(`https://api.github.com/${path}&page=${page}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" },
+    });
+    if (!r.ok) throw new Error(`github ${r.status} ${r.statusText}`.trim());
+    // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
+    const batch = (await r.json()) as GhReview[];
+    reviews.push(...batch);
+    // A short final page means we've read every review — the list is complete.
+    if (batch.length < 100) return reviews;
+    // A full page on the last allowed page is only truncated if GitHub says there's more; trust the
+    // `Link` header's `rel="next"` (mirrors {@link fetchPrFiles}) so an exact multiple of 100 isn't a
+    // false positive, and throw when the cap genuinely truncates rather than under-reading history.
+    if (page === MAX_PAGES && /<[^>]*>;\s*rel="next"/.test(r.headers.get("link") ?? "")) {
+      throw new Error(
+        `github pr reviews truncated: ${repo}#${number} exceeds ${MAX_PAGES * 100}-review paging cap`,
+      );
+    }
+  }
+  return reviews;
 }
 
 // ── Review-comment convergence gate (don't converge with unaddressed comments) ──────────────
@@ -279,36 +314,73 @@ export function pickLatestCopilotReviewBody(
   reviews: { user?: { login?: string }; body?: string }[],
   truncated: boolean,
 ): string | null {
+  const picked = pickLatestCopilotReview(reviews, truncated);
+  return picked === null ? null : picked.body;
+}
+
+/** Pick the newest Copilot review — body AND the commit SHA it was submitted against — from a
+ * reviews list (GitHub returns them oldest→newest). Semantics mirror {@link pickLatestCopilotReviewBody}
+ * exactly: `truncated = true` fails CLOSED (`null`, unverifiable); a verified-complete read with no
+ * Copilot review returns `{ body: "", commitId: null }` (a verified "no advisories"). The `commitId`
+ * lets a caller detect a review that predates the PR's current HEAD — a STALE review whose advisories
+ * are about code the head has since moved past (issue #799). Pure; unit-tested. */
+export function pickLatestCopilotReview(
+  reviews: { user?: { login?: string }; body?: string; commit_id?: string | null }[],
+  truncated: boolean,
+): { body: string; commitId: string | null } | null {
   if (truncated) return null;
   const copilot = reviews.filter((rv) => isCopilot(rv.user?.login));
-  return copilot[copilot.length - 1]?.body ?? "";
+  const latest = copilot[copilot.length - 1];
+  return { body: latest?.body ?? "", commitId: latest?.commit_id ?? null };
 }
 
 /** Fetch the latest Copilot review body for a PR (the newest review authored by the automated
  * Copilot reviewer). Returns `null` ONLY when no transport is usable (unverifiable → the worker
  * fails closed); returns `""` when transport is usable but the PR has no Copilot review yet (a
  * verified "no suppressed advisories"). Throws on a genuine transport failure. This split keeps
- * `null` from conflating "unverifiable" with "empty" and fail-OPENing the advisory dimension. */
+ * `null` from conflating "unverifiable" with "empty" and fail-OPENing the advisory dimension.
+ * Thin wrapper over {@link fetchLatestCopilotReview} (the single fetch implementation). */
 export async function fetchLatestCopilotReviewBody(
   repo: string,
   number: number | string,
   token: string,
 ): Promise<string | null> {
+  const picked = await fetchLatestCopilotReview(repo, number, token);
+  return picked === null ? null : picked.body;
+}
+
+/** Fetch the latest Copilot review — body AND the commit SHA it was submitted against — for a PR.
+ * Same null/`""`-vs-unverifiable semantics as {@link fetchLatestCopilotReviewBody} (which delegates
+ * here): `null` ONLY when no transport is usable (unverifiable → fail closed); a verified read with
+ * no Copilot review yet returns `{ body: "", commitId: null }`. The `commitId` lets the convergence
+ * gate detect a review that predates the PR's current HEAD — a STALE review whose advisories are
+ * about code the head has since moved past (issue #799) — and re-solicit a fresh review rather than
+ * block/escalate against the obsolete body. Throws on a genuine transport failure. */
+export async function fetchLatestCopilotReview(
+  repo: string,
+  number: number | string,
+  token: string,
+): Promise<{ body: string; commitId: string | null } | null> {
   const mode = githubTransport();
   const useGh = mode === "gh" || (mode === "auto" && (await isGhAvailable()));
   const basePath = `repos/${repo}/pulls/${number}/reviews?per_page=100`;
   interface Review {
     user?: { login?: string };
     body?: string;
+    commit_id?: string | null;
   }
   if (useGh) {
-    // `--paginate` merges EVERY page of the (oldest→newest) reviews array, so a >100-review
+    // `--paginate --slurp` walks EVERY page of the (oldest→newest) reviews array, so a >100-review
     // convergence loop still surfaces the genuinely newest Copilot review rather than the oldest
-    // 100 — reading only the first page here would fail-OPEN the advisory dimension.
-    const out = await runGh(["api", "--paginate", basePath, "-H", "Accept: application/vnd.github+json"]);
+    // 100 — reading only the first page here would fail-OPEN the advisory dimension. Plain
+    // `--paginate` concatenates one JSON array PER PAGE (multiple documents) which `JSON.parse`
+    // cannot read; `--slurp` wraps the pages in an outer array we flatten one level.
+    const out = await runGh([
+      "api", "--paginate", "--slurp", basePath, "-H", "Accept: application/vnd.github+json",
+    ]);
     // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-    const reviews = JSON.parse(out) as Review[];
-    return pickLatestCopilotReviewBody(reviews, false);
+    const reviews = (JSON.parse(out) as Review[][]).flat();
+    return pickLatestCopilotReview(reviews, false);
   }
   if (!token) return null;
   // Page the token transport the same way; 20×100 reviews is far past any real convergence loop, and
@@ -324,14 +396,14 @@ export async function fetchLatestCopilotReviewBody(
     const batch = (await r.json()) as Review[];
     reviews.push(...batch);
     // A short page means we've read every review — the list is complete.
-    if (batch.length < 100) return pickLatestCopilotReviewBody(reviews, false);
+    if (batch.length < 100) return pickLatestCopilotReview(reviews, false);
     // A full page on the last allowed page is only truncated if GitHub says there's more; trust the
     // `Link` header's `rel="next"` so an exact multiple of 100 isn't a false positive.
     if (page === MAX_PAGES && /<[^>]*>;\s*rel="next"/.test(r.headers.get("link") ?? "")) {
-      return pickLatestCopilotReviewBody(reviews, true);
+      return pickLatestCopilotReview(reviews, true);
     }
   }
-  return pickLatestCopilotReviewBody(reviews, false);
+  return pickLatestCopilotReview(reviews, false);
 }
 
 /** Raw GraphQL response shape for the review-threads query. */
