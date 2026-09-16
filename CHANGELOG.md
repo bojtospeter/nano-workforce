@@ -1,3 +1,9 @@
+## [0.187.6](https://github.com/nanobpm/nano-workforce/compare/v0.187.5...v0.187.6) (2026-09-16)
+
+### Bug Fixes
+
+* **convergence:** re-solicit on a stale Copilot review instead of re-escalating ([#799](https://github.com/nanobpm/nano-workforce/issues/799)) ([#803](https://github.com/nanobpm/nano-workforce/issues/803)) ([58a99b6](https://github.com/nanobpm/nano-workforce/commit/58a99b6024af6cef37f724f9d50cf6151a6f061c)), closes [#789](https://github.com/nanobpm/nano-workforce/issues/789)
+
 ## [0.187.5](https://github.com/nanobpm/nano-workforce/compare/v0.187.4...v0.187.5) (2026-09-15)
 
 ### Bug Fixes
