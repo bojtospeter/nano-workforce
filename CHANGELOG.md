@@ -1,3 +1,9 @@
+## [0.188.0](https://github.com/nanobpm/nano-workforce/compare/v0.187.6...v0.188.0) (2026-09-17)
+
+### Features
+
+* **convergence:** bounded agent auto-ack before human escalation on ack-only converge blocks ([#800](https://github.com/nanobpm/nano-workforce/issues/800)) ([be0f7a2](https://github.com/nanobpm/nano-workforce/commit/be0f7a2f04ef768a2acdfdf229131e7158834026)), closes [#789](https://github.com/nanobpm/nano-workforce/issues/789) [Magikcraft/nano-bpm#1199](https://github.com/Magikcraft/nano-bpm/issues/1199) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#787](https://github.com/nanobpm/nano-workforce/issues/787) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [787/#796](https://github.com/787/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [787/#796](https://github.com/787/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796) [#796](https://github.com/nanobpm/nano-workforce/issues/796)
+
 ## [0.187.6](https://github.com/nanobpm/nano-workforce/compare/v0.187.5...v0.187.6) (2026-09-16)
 
 ### Bug Fixes
