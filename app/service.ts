@@ -159,6 +159,20 @@ export const MAX_REBASE_ROUNDS = clampCiFixBudget(process.env.NANO_PR_MAX_REBASE
  * retry (a race escalates immediately). Reuses the CI-fix budget clamp (allows 0 = disable). */
 export const MAX_MERGE_RETRIES = clampCiFixBudget(process.env.NANO_PR_MAX_MERGE_RETRIES, 5);
 
+/** How many times the convergence loop will re-dispatch the `senior:pr-review` (review-round) agent
+ * to auto-ack unacked suppressed advisories before escalating to a human. When the converge-gate
+ * blocks SOLELY on unacknowledged suppressed advisories (no unresolved inline threads), the block is
+ * recoverable: re-running the review-round agent posts the missing `nano-ack:` threads and converges,
+ * so the loop tries that — bounded — before parking the human `wait-answer` (issue #796). A resolved
+ * `Declined … nano-ack:` advisory is an acknowledgement and CONVERGES (issue #787), so a decline does
+ * not escalate; only the agent returning `needs_input` (a genuinely contested advisory it cannot
+ * decide) or `blocked` (an external blocker it reports with a question — the `gw-status` arm at
+ * `convergence-loop.bpmn:442-443` routes both to `wait-answer`), or this budget being exhausted,
+ * escalates. Default 2; set
+ * `NANO_PR_MAX_ACK_RETRIES=0` to escalate on the first ack-only block. Reuses the CI-fix budget clamp
+ * (allows 0 = disable, ceiling-capped). */
+export const MAX_ACK_RETRIES = clampCiFixBudget(process.env.NANO_PR_MAX_ACK_RETRIES, 2);
+
 /** How many times the mergeable-wait timeout backstop (`merge-stall-probe`) will re-derive
  * mergeability from ground truth and re-arm the merge stage before giving up and escalating to a
  * human. Bounds the timer arm of the `gw-merge-wait` event-based gateway so a dead in-process poller
@@ -644,6 +658,11 @@ export async function submitPr(
       round: 1,
       maxRounds: clampRounds(maxRounds, MAX_ROUNDS),
       reviewWaitTimeout: REVIEW_WAIT_TIMEOUT,
+      // Bounded agent auto-ack (issue #796): the convergence loop re-dispatches the review-round
+      // agent up to `ackRetryMax` times to ack suppressed advisories when the converge-gate blocks
+      // solely on unacked ones, before escalating to a human. `ackRetryRound` counts those passes.
+      ackRetryRound: 0,
+      ackRetryMax: MAX_ACK_RETRIES,
       // Lineage (issue #245): carry the origin identity onto the convergence instance so every
       // descendant (and any message it correlates) is stitched back to the originating request.
       // A human/webhook PR that is its own root carries its own `pr_key` (never NULL — see above).

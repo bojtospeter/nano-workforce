@@ -281,25 +281,59 @@ export function parseSuppressedAdvisories(reviewBody: string | null | undefined)
   return out;
 }
 
+/** The line-stable advisory keys carried by a SINGLE comment body's canonical `nano-ack: <path> ::
+ * <text>` markers. This is the SOLE recognizer of an acknowledgement, shared by `isAckThread` and
+ * `parseAckedAdvisories` so "is this an ack?" has ONE canonical implementation (derivation over
+ * duplication — no drift between the two consumers). The bare `nano-ack: <path>:<line>` form yields
+ * NOTHING here: `NEW_ACK` requires the ` :: <text>` prose (a bare `path:line` is prose-blind and
+ * would false-OPEN a new advisory re-emitted at a previously-acked line). */
+function canonicalAckKeys(body: string): string[] {
+  const keys: string[] = [];
+  ACK_MARKER.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  // biome-ignore lint/suspicious/noAssignInExpressions: canonical regex-exec accumulation loop
+  while ((m = ACK_MARKER.exec(body)) !== null) {
+    const nw = NEW_ACK.exec(m[1].trim());
+    if (nw) keys.push(advisoryStableKey(nw[1], nw[2]));
+  }
+  return keys;
+}
+
+/** True when a review thread is a DEDICATED `nano-ack:` acknowledgement thread — one whose ROOT
+ * comment (`bodies[0]`, the thread-opening comment) carries a valid canonical `nano-ack: <path> ::
+ * <text>` marker — rather than a substantive code-review thread. This is a CLASSIFICATION only: the
+ * converge gate never DROPS an unresolved thread on the strength of this predicate. An unresolved ack
+ * thread still BLOCKS convergence (it is a genuinely-open GitHub thread); the classification only
+ * routes that block onto the recoverable ack-only path — a partially-completed acknowledgement the
+ * bounded #796 auto-ack retry can finish (post-and-resolve) — instead of escalating a human. A
+ * substantive unresolved thread escalates to a human.
+ *
+ * Because the gate BLOCKS either way, this predicate is FAIL-CLOSED even under a false positive:
+ *   1. Only the canonical prose-keyed form counts (via `canonicalAckKeys`); the retired bare
+ *      `nano-ack: <path>:<line>` form does NOT — matching `parseAckedAdvisories`.
+ *   2. Only the ROOT comment is inspected — a reviewer's substantive finding is ALWAYS its thread's
+ *      root and (canonical-form) never carries this marker, so a substantive thread that merely
+ *      quotes or replies `nano-ack:` in a later comment is not mis-classified.
+ *   3. Even if a root DID quote the canonical marker mid-prose and were mis-labelled an ack, the
+ *      thread is NOT excluded — it still blocks (as ack-only), and the bounded auto-ack retry cannot
+ *      ack a non-advisory, so it escalates to a human on exhaustion. Marker presence never finalizes
+ *      the gate with an open thread (the fail-OPEN this design forecloses). */
+export function isAckThread(thread: ReviewThread): boolean {
+  const root = thread.bodies[0];
+  return root !== undefined && canonicalAckKeys(root).length > 0;
+}
+
 /** Extract the acknowledged advisory keys from a set of review threads (only RESOLVED threads
  * count — an open ack thread is not yet an acknowledgement). Returns line-stable keys (`<path>#<fp>`)
- * parsed from the `nano-ack: <path> :: <text>` form ONLY. A bare `nano-ack: <path>:<line>` marker is
- * intentionally NOT honoured: its `path:line` key is blind to the advisory prose and would false-OPEN
- * a genuinely new advisory re-emitted at a previously-acked line. The gate treats an advisory as
- * acked iff its stable key appears here. */
+ * parsed from the `nano-ack: <path> :: <text>` form ONLY (via the shared `canonicalAckKeys`). A bare
+ * `nano-ack: <path>:<line>` marker is intentionally NOT honoured: its `path:line` key is blind to the
+ * advisory prose and would false-OPEN a genuinely new advisory re-emitted at a previously-acked line.
+ * The gate treats an advisory as acked iff its stable key appears here. */
 export function parseAckedAdvisories(threads: ReviewThread[]): string[] {
   const acked = new Set<string>();
   for (const t of threads) {
     if (!t.isResolved) continue;
-    for (const body of t.bodies) {
-      ACK_MARKER.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      // biome-ignore lint/suspicious/noAssignInExpressions: canonical regex-exec accumulation loop
-      while ((m = ACK_MARKER.exec(body)) !== null) {
-        const nw = NEW_ACK.exec(m[1].trim());
-        if (nw) acked.add(advisoryStableKey(nw[1], nw[2]));
-      }
-    }
+    for (const body of t.bodies) for (const k of canonicalAckKeys(body)) acked.add(k);
   }
   return [...acked];
 }

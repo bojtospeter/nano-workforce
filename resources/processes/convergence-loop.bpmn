@@ -65,6 +65,7 @@
         <nano:shape id="PrConvergeGateOut" name="Converge gate — result">
           <nano:extend name="convergeBlocked" type="boolean" />
           <nano:extend name="convergeBlockReason" type="string" optional="true" />
+          <nano:extend name="convergeAckOnly" type="boolean" optional="true" />
           <nano:extend name="reviewStale" type="boolean" optional="true" />
         </nano:shape>
         <nano:shape id="EscalationIn" name="Record escalation — input">
@@ -145,6 +146,7 @@
       <bpmn:incoming>f_reviewLoop</bpmn:incoming>
       <bpmn:incoming>f_answerLoop</bpmn:incoming>
       <bpmn:incoming>f_huskRetry</bpmn:incoming>
+      <bpmn:incoming>f_ackRetry</bpmn:incoming>
       <bpmn:outgoing>f_capture</bpmn:outgoing>
     </bpmn:serviceTask>
     <bpmn:exclusiveGateway id="gw-status" name="status?" default="f_addressed">
@@ -331,6 +333,9 @@
           <zeebe:property name="io.nanobpm.dataEnvelope.in" value="PrConvergeGateIn" />
           <zeebe:property name="io.nanobpm.dataEnvelope.out" value="PrConvergeGateOut" />
         </zeebe:properties>
+        <zeebe:ioMapping>
+          <zeebe:output source="=if convergeBlocked = true and convergeAckOnly = true then ackRetryRound + 1 else ackRetryRound" target="ackRetryRound" />
+        </zeebe:ioMapping>
       </bpmn:extensionElements>
       <bpmn:incoming>f_converged</bpmn:incoming>
       <bpmn:outgoing>f_toConvergeGate</bpmn:outgoing>
@@ -340,6 +345,11 @@
       <bpmn:outgoing>f_convergeBlocked</bpmn:outgoing>
       <bpmn:outgoing>f_convergeStale</bpmn:outgoing>
       <bpmn:outgoing>f_convergeOk</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="gw-ack-retry" name="auto-ack within budget?" default="f_ackEscalate">
+      <bpmn:incoming>f_convergeBlocked</bpmn:incoming>
+      <bpmn:outgoing>f_ackRetry</bpmn:outgoing>
+      <bpmn:outgoing>f_ackEscalate</bpmn:outgoing>
     </bpmn:exclusiveGateway>
     <bpmn:serviceTask id="persist-escalation-blockedcomments" name="Escalate: unaddressed comments">
       <bpmn:extensionElements>
@@ -354,7 +364,7 @@
           <zeebe:input source="=convergeBlockReason" target="question" />
         </zeebe:ioMapping>
       </bpmn:extensionElements>
-      <bpmn:incoming>f_convergeBlocked</bpmn:incoming>
+      <bpmn:incoming>f_ackEscalate</bpmn:incoming>
       <bpmn:outgoing>f_blockedGate</bpmn:outgoing>
     </bpmn:serviceTask>
     <bpmn:serviceTask id="classify-scope" name="Scope classifier (agent)">
@@ -407,9 +417,13 @@
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=status = "converged"</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_toConvergeGate" sourceRef="check-converge" targetRef="gw-converge-gate" />
-    <bpmn:sequenceFlow id="f_convergeBlocked" name="unaddressed comments" sourceRef="gw-converge-gate" targetRef="persist-escalation-blockedcomments">
+    <bpmn:sequenceFlow id="f_convergeBlocked" name="unaddressed comments" sourceRef="gw-converge-gate" targetRef="gw-ack-retry">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=convergeBlocked = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_ackRetry" name="ack-only within budget" sourceRef="gw-ack-retry" targetRef="capture-head">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=convergeAckOnly = true and ackRetryRound &lt;= ackRetryMax</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_ackEscalate" name="threads / budget exhausted" sourceRef="gw-ack-retry" targetRef="persist-escalation-blockedcomments" />
     <bpmn:sequenceFlow id="f_convergeStale" name="review stale" sourceRef="gw-converge-gate" targetRef="persist-round">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=reviewStale = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
@@ -556,8 +570,14 @@
           <dc:Bounds x="954" y="62" width="74" height="28" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_gw-ack-retry" bpmnElement="gw-ack-retry" isMarkerVisible="true">
+        <dc:Bounds x="1141" y="415" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1136" y="368" width="60" height="42" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="BPMNShape_persist-escalation-blockedcomments" bpmnElement="persist-escalation-blockedcomments">
-        <dc:Bounds x="1116" y="400" width="100" height="80" />
+        <dc:Bounds x="1316" y="400" width="100" height="80" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="BPMNShape_classify-scope" bpmnElement="classify-scope">
         <dc:Bounds x="1116" y="80" width="100" height="80" />
@@ -622,6 +642,18 @@
         <di:waypoint x="1616" y="120" />
         <di:waypoint x="1723" y="120" />
       </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_ackEscalate" bpmnElement="f_ackEscalate">
+        <di:waypoint x="1191" y="440" />
+        <di:waypoint x="1316" y="440" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1220" y="393" width="67" height="42" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_blockedGate" bpmnElement="f_blockedGate">
+        <di:waypoint x="1416" y="440" />
+        <di:waypoint x="2427" y="440" />
+        <di:waypoint x="2427" y="305" />
+      </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_guardOk" bpmnElement="f_guardOk">
         <di:waypoint x="1766" y="600" />
         <di:waypoint x="1891" y="600" />
@@ -672,15 +704,15 @@
         <di:waypoint x="1166" y="660" />
         <di:waypoint x="1166" y="640" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="2159" y="613" width="74" height="42" />
+          <dc:Bounds x="2219" y="613" width="74" height="42" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_convergeBlocked" bpmnElement="f_convergeBlocked">
         <di:waypoint x="991" y="145" />
         <di:waypoint x="991" y="440" />
-        <di:waypoint x="1116" y="440" />
+        <di:waypoint x="1141" y="440" />
         <bpmndi:BPMNLabel>
-          <dc:Bounds x="1013" y="407" width="81" height="28" />
+          <dc:Bounds x="1026" y="407" width="81" height="28" />
         </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_convergeStale" bpmnElement="f_convergeStale">
@@ -750,22 +782,16 @@
         <di:waypoint x="1616" y="280" />
         <di:waypoint x="2402" y="280" />
       </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="BPMNEdge_f_blockedGate" bpmnElement="f_blockedGate">
-        <di:waypoint x="1216" y="440" />
-        <di:waypoint x="1636" y="440" />
-        <di:waypoint x="1636" y="305" />
-        <di:waypoint x="2382" y="305" />
-        <di:waypoint x="2382" y="280" />
-        <di:waypoint x="2402" y="280" />
-      </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_reviewStalled" bpmnElement="f_reviewStalled">
         <di:waypoint x="2102" y="760" />
         <di:waypoint x="2202" y="760" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_stalledGate" bpmnElement="f_stalledGate">
-        <di:waypoint x="2252" y="720" />
-        <di:waypoint x="2252" y="280" />
-        <di:waypoint x="2402" y="280" />
+        <di:waypoint x="2302" y="760" />
+        <di:waypoint x="2472" y="760" />
+        <di:waypoint x="2472" y="305" />
+        <di:waypoint x="2472" y="280" />
+        <di:waypoint x="2452" y="280" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_escGate" bpmnElement="f_escGate">
         <di:waypoint x="866" y="1240" />
@@ -780,15 +806,23 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_maxGate" bpmnElement="f_maxGate">
         <di:waypoint x="1966" y="920" />
-        <di:waypoint x="2322" y="920" />
-        <di:waypoint x="2322" y="305" />
-        <di:waypoint x="2382" y="305" />
-        <di:waypoint x="2382" y="280" />
-        <di:waypoint x="2402" y="280" />
+        <di:waypoint x="2472" y="920" />
+        <di:waypoint x="2472" y="305" />
+        <di:waypoint x="2472" y="280" />
+        <di:waypoint x="2452" y="280" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_answerRecord" bpmnElement="f_answerRecord">
         <di:waypoint x="2652" y="280" />
         <di:waypoint x="2752" y="280" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="BPMNEdge_f_ackRetry" bpmnElement="f_ackRetry">
+        <di:waypoint x="1166" y="465" />
+        <di:waypoint x="1166" y="485" />
+        <di:waypoint x="266" y="485" />
+        <di:waypoint x="266" y="160" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="686" y="438" width="60" height="42" />
+        </bpmndi:BPMNLabel>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="BPMNEdge_f_huskRetry" bpmnElement="f_huskRetry">
         <di:waypoint x="1741" y="1105" />

@@ -6,15 +6,28 @@
 // the comment unaddressed). This step runs on the converged path, BEFORE the scope classifier and
 // pr.finalize hand off to the merge loop, and blocks handoff while GitHub still shows unaddressed
 // comments:
-//   • any review THREAD is still unresolved (GraphQL `isResolved = false`), or
+//   • any SUBSTANTIVE review THREAD is still unresolved (GraphQL `isResolved = false`), or an
+//     unresolved `nano-ack:` ACK thread is open — an ack thread is a partially-completed
+//     acknowledgement the bounded #796 auto-ack retry can finish, so it still BLOCKS (a
+//     genuinely-open GitHub thread) but the block stays ack-only (recoverable) rather than escalating
+//     to a human; only a substantive open thread escalates, or
 //   • any SUPPRESSED advisory in the latest Copilot review body lacks a matching RESOLVED ack
 //     thread (a `nano-ack: <path> :: <verbatim advisory text>` marker whose line-stable prose
 //     fingerprint matches Copilot's advisory). The bare legacy `nano-ack: <path>:<line>` form is
 //     NOT honoured: keyed only on `path:line`, it is blind to the advisory prose and would let a
 //     resolved ack for one advisory silently acknowledge a genuinely new advisory re-emitted at
 //     that same line (a false-OPEN). Only the prose-keyed `<path> :: <text>` form acknowledges.
-// A blocked gate returns `convergeBlocked = true`; the model's `gw-converge-gate` gateway routes to
-// the human `wait-answer` escalation (recoverable), never a hard wedge.
+// A blocked gate returns `convergeBlocked = true` (recoverable, never a hard wedge); the route then
+// depends on WHY it blocked. An ack-only block (`convergeAckOnly = true` — sole cause is unacked
+// suppressed advisories and/or an unresolved `nano-ack:` ack thread) re-dispatches the `review-round`
+// agent first, bounded by `ackRetryMax`, and only reaches the human `wait-answer` escalation once
+// that budget is exhausted. A substantive unresolved thread routes to `wait-answer` immediately.
+//
+// STALE-REVIEW GUARD (issue #799): when the PR HEAD has advanced PAST the commit the latest Copilot
+// review was submitted against, that review's body describes code the head has moved past, so the
+// gate signals `reviewStale = true` (rather than blocking on the obsolete body) and the process
+// re-enters the review wait for a fresh review of the current HEAD. The head read fails OPEN, so a
+// transport hiccup can never fabricate a stale verdict.
 //
 // Scope integrity is NO LONGER judged here. A deterministic regex over the PR description could not
 // read the closed issue's acceptance criteria, so it false-positived on any body that merely
@@ -34,6 +47,7 @@ import {
   fetchLatestCopilotReview,
   fetchPrHead,
   fetchReviewThreads,
+  isAckThread,
   parseAckedAdvisories,
   parseSuppressedAdvisories,
   type ReviewThread,
@@ -85,23 +99,24 @@ export function makeHandler(deps: {
     const ghRepo = repo ?? parsed?.repo;
     const ghNumber = typeof prNumber === "number" ? prNumber : parsed?.number;
     if (!ghRepo || typeof ghNumber !== "number") {
-      return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, reviewStale: false };
+      return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, convergeAckOnly: false, reviewStale: false };
     }
 
     let result: ConvergeGateResult;
     try {
       const threadsRead = await deps.readThreads(ghRepo, ghNumber);
       // A null threads read is an unverifiable gate — fail closed. (An empty ARRAY is a verified
-      // "no threads" and is fine.)
+      // "no threads" and is fine.) An unverifiable block is NOT ack-only: it needs a human to
+      // confirm GitHub state, so it must not enter the bounded agent auto-ack path (#796).
       if (threadsRead === null) {
-        return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, reviewStale: false };
+        return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, convergeAckOnly: false, reviewStale: false };
       }
       const review = await deps.readReview(ghRepo, ghNumber);
       // A null review read is an unverifiable read (no usable transport) — fail closed, same as a
       // null threads read. (A `{ body: "", commitId: null }` result is a verified "no Copilot
       // review / no advisories".)
       if (review === null) {
-        return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, reviewStale: false };
+        return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, convergeAckOnly: false, reviewStale: false };
       }
       // STALE-REVIEW GUARD (issue #799). When the PR HEAD has advanced PAST the commit the latest
       // Copilot review was submitted against, that review's suppressed advisories describe code the
@@ -113,22 +128,39 @@ export function makeHandler(deps: {
       // fabricate a stale verdict; the ordinary gate below still runs on a HEAD-current review.
       const headSha = await readHeadSha(ghRepo, ghNumber).catch(() => null);
       if (isReviewStale(review.commitId, headSha)) {
-        return { convergeBlocked: false, convergeBlockReason: "", reviewStale: true };
+        return { convergeBlocked: false, convergeBlockReason: "", convergeAckOnly: false, reviewStale: true };
       }
-      const unresolvedThreadCount = threadsRead.filter((t) => !t.isResolved).length;
+      // Split the unresolved threads into SUBSTANTIVE reviewer findings vs partially-completed
+      // `nano-ack:` ACK threads (root carries a canonical `nano-ack: <path> :: <text>` marker — see
+      // `isAckThread`). Neither is ever dropped from the gate: a substantive unresolved thread blocks
+      // and escalates to a human; an unresolved ack thread ALSO blocks (it is a genuinely-open GitHub
+      // thread), but the block stays ack-only (recoverable by the bounded #796 auto-ack retry, which
+      // re-posts/resolves it). Keeping the ack thread a BLOCKING condition — rather than filtering it
+      // away — is what makes the root-marker classifier fail-CLOSED: a mislabelled substantive thread
+      // still blocks (as ack-only) instead of finalizing with the finding open, and the bounded retry
+      // cannot ack a non-advisory, so it escalates to a human on exhaustion.
+      const unresolved = threadsRead.filter((t) => !t.isResolved);
+      const unresolvedAckThreadCount = unresolved.filter((t) => isAckThread(t)).length;
+      const unresolvedThreadCount = unresolved.length - unresolvedAckThreadCount;
       const advisories = parseSuppressedAdvisories(review.body);
       result = evaluateConvergeGate({
         unresolvedThreadCount,
+        unresolvedAckThreadCount,
         suppressedAdvisories: advisories.map((a) => ({ key: a.key, label: a.label })),
         acknowledgedKeys: parseAckedAdvisories(threadsRead),
       });
     } catch {
-      return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, reviewStale: false };
+      return { convergeBlocked: true, convergeBlockReason: BLOCK_UNVERIFIABLE, convergeAckOnly: false, reviewStale: false };
     }
 
     return {
       convergeBlocked: result.convergeBlocked,
       convergeBlockReason: result.convergeBlockReason,
+      // Signals the bounded agent auto-ack path (#796): a block whose sole cause is recoverable —
+      // unacked suppressed advisories AND/OR a lone unresolved `nano-ack:` ack thread (a
+      // partially-completed acknowledgement), with NO substantive unresolved thread — re-dispatches
+      // the review-round agent before escalating to a human.
+      convergeAckOnly: result.ackOnly,
       reviewStale: false,
     };
   };

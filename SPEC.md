@@ -99,27 +99,36 @@ known at submit time, carried as a process variable and stored on the DB row.
 │         │
 │         ▼
 │    <gateway: status>
-│      ├── converged  → [Mark converged] → (end: converged)
-│      │
-│      ├── addressed  → [Record round] → [Check progress] (did the PR head advance?)
+│      ├── converged  → [Check review comments] (pr.converge-gate; ++ackRetryRound on ack-only block)
+│      │                   → <gateway: comments addressed?>
+│      │                       ├── addressed → [Scope classifier] → … → [Mark converged] → (end)
+│      │                       ├── review stale (#799) → [Record round] (re-solicit fresh review) ┐
+│      │                       └── unaddressed → <gateway: auto-ack within budget?>               │
+│      │                            ├── convergeAckOnly and ackRetryRound ≤ ackRetryMax           │
+│      │                            │      → re-dispatch review-round (round unchanged) ───────────┤
+│      │                            └── unresolved thread / budget exhausted                      │
+│      │                                 → [Escalate: unaddressed comments] (blocked)             │
+│      │                                 → [Wait: wait-answer userTask] ────────────────────────────┤
+│      │                                                                                          │
+│      ├── addressed  → [Record round] → [Check progress] (did the PR head advance?)              │
 │      │                   ├── progressed → <guard: round ≥ maxRounds → escalate "not converged"> │
 │      │                   │                   → <event-based gateway: review ready or timeout?>   │
-│      │                   │      ├── readiness-ready (msg catch, key = prKey) → round++ ─┐
-│      │                   │      └── =reviewWaitTimeout (timer catch)                    │
-│      │                   │           → [Escalate: review stalled] (blocked)             │
-│      │                   │           → [Wait: wait-answer userTask] ────────────────────┤
-│      │                   └── no progress → <husk? no commit AND no terminal instance>   │
+│      │                   │      ├── readiness-ready (msg catch, key = prKey) → round++ ─┐        │
+│      │                   │      └── =reviewWaitTimeout (timer catch)                     │        │
+│      │                   │           → [Escalate: review stalled] (blocked)             │        │
+│      │                   │           → [Wait: wait-answer userTask] ────────────────────┤        │
+│      │                   └── no progress → <husk? no commit AND no terminal instance>   │        │
 │      │                          ├── husk & retries < MAX → re-enter [Review round] (bypasses the round-cap guard) │
-│      │                          └── no-advance / husk cap → [Escalate: no progress]      │
-│      │                                     → [Wait: wait-answer userTask] ───────────────────┤
-│      │                                                                             │
-│      └── needs_input     [Record escalation]                       │               │
-│          or blocked  →   (kind = question | blocker)               │               │
-│                          → [Wait: wait-answer userTask]            │               │
-│                          → [record-answer: pr.answer-escalation]   │               │
-│                          → set answer ──────────────────────────────┤               │
-│                                                                    │               │
-└────────────────────────────────────────────────────────────────────┴───────────────┘
+│      │                          └── no-advance / husk cap → [Escalate: no progress]      │       │
+│      │                                     → [Wait: wait-answer userTask] ───────────────────┤   │
+│      │                                                                             │            │
+│      └── needs_input     [Record escalation]                       │               │            │
+│          or blocked  →   (kind = question | blocker)               │               │            │
+│                          → [Wait: wait-answer userTask]            │               │            │
+│                          → [record-answer: pr.answer-escalation]   │               │            │
+│                          → set answer ──────────────────────────────┤               │            │
+│                                                                    │               │            │
+└────────────────────────────────────────────────────────────────────┴───────────────┴────────────┘
 
 Both `needs_input` (the agent has a question) and `blocked` (the agent is stuck
 on something external — auth, a failing push, a missing secret) route to the
@@ -145,9 +154,14 @@ Notes:
 - **Convergence comment-gate + stale-review re-solicitation (issue #799).** The
   agent's self-reported `converged` does not finalize directly: it first runs the
   deterministic `pr.converge-gate` (`check-converge` → `gw-converge-gate`). That
-  gate **blocks** convergence (`convergeBlocked = true` → escalate "unaddressed
-  comments") while any review thread is unresolved or any suppressed advisory
-  lacks a resolved `nano-ack:` thread; otherwise it proceeds to the scope
+  gate **blocks** convergence (`convergeBlocked = true`) while any review thread
+  is unresolved or any suppressed advisory lacks a resolved `nano-ack:` thread.
+  A block whose *sole* outstanding items are unresolved `nano-ack:` threads is
+  classified **ack-only** and does **not** immediately escalate to a human:
+  within the `ackRetryMax` budget the bounded auto-ack retry re-dispatches
+  `review-round` (round unchanged) to finish the acknowledgements; only a
+  substantive unresolved thread — or an exhausted ack-retry budget — escalates
+  ("unaddressed comments"). Otherwise the gate proceeds to the scope
   classifier and finalizes. A third arm handles a **stale review** — one whose
   `commit_id` predates the PR's current HEAD (its advisories describe code the
   head has moved past, e.g. an advisory already fixed in a later commit). Rather
@@ -182,6 +196,40 @@ Notes:
   backstop when even repeated nudges fail.
 - On `needs_input`, the same `round` is retried after the answer (the answer is
   added to the agent's context; the round number does not advance).
+- On `converged`, the run does **not** finalize blindly: it first runs the
+  deterministic **converge gate** (`pr.converge-gate`, `Check review comments`),
+  which re-reads GitHub and re-blocks (`convergeBlocked=true`) while **any
+  substantive** review thread is unresolved or **any** suppressed advisory lacks a
+  resolved `nano-ack:` thread. An unresolved `nano-ack:` **ack thread** is **never
+  dropped** from the gate — it is a genuinely-open GitHub thread, so it still
+  **blocks** convergence — but a block whose only open threads are unresolved acks
+  is classified **ack-only**: a partially-completed acknowledgement the bounded
+  auto-ack retry can finish (post-and-resolve), not a code-review finding, so it
+  stays on the recoverable path instead of escalating. (An ack thread is one whose
+  *root* comment carries a canonical `nano-ack: <path> :: <text>` marker; a
+  substantive reviewer finding never does, so it escalates. Because an unresolved
+  ack still blocks either way, this classification is **fail-closed**: even a
+  mislabelled root cannot finalize the gate with an open thread — worst case it
+  routes to the bounded ack-retry, which cannot ack a non-advisory and so escalates
+  to a human on exhaustion.)
+  A block whose SOLE cause is unacknowledged suppressed
+  advisories or unresolved ack threads (no unresolved *substantive* thread) is
+  flagged **ack-only**
+  (`convergeAckOnly=true`) and is routine + recoverable: rather than pulling a
+  human in first, the loop makes a **bounded auto-ack re-dispatch** of
+  `review-round` — up to `ackRetryMax` times, advancing `ackRetryRound` on each
+  ack-only block (seeded from `NANO_PR_MAX_ACK_RETRIES`). It escalates to the human
+  `wait-answer` only when the block is **not** ack-only (an unresolved inline
+  thread), or the budget is exhausted. Both counters are process variables.
+- **Contested advisory → human is via the agent's `needs_input`, not a decline
+  (#787 / #796).** A resolved `Declined, false positive. nano-ack: …` thread is a
+  *considered agent adjudication* and, by design (#787), keeps the advisory
+  acknowledged so the gate **converges** — a stateless gate cannot re-block a
+  decline without re-introducing the #787 per-round-escalation livelock. The
+  "genuinely contested advisory surfaces to a human" path of #796 is reached when
+  the (re-dispatched) agent cannot decide and returns **`needs_input`** — that
+  routes through the normal status-escalation arm to `wait-answer`. Decline =
+  agent-adjudicated → converge; `needs_input` = agent defers → human.
 - **No-progress guard + husk classification (issue #786).** Before the review
   wait, an `addressed` round passes through `pr.progress-check`
   (`workers/progress-check/worker.ts`, mirrored by `app/roundProgress.ts`): it
