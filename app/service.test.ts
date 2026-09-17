@@ -11,7 +11,7 @@ import { memDataFor } from "../test/worldDb.ts";
 import { withTrackingViews } from "../test/trackingViews.ts";
 import { DurableResumeRegistry } from "./durableResume.ts";
 import { WorldStore } from "./world/index.ts";
-import { abandonClosedPr, isPrSettled, parsePr, pollCapabilityGatesImpl, pollIncidentsImpl, pollReviews, pollWaveGatesImpl, repoEnvelopeVars, startMerge, submitPr, worldRestoreSha } from "./service.ts";
+import { abandonClosedPr, isPrSettled, MAX_ACK_RETRIES, parsePr, pollCapabilityGatesImpl, pollIncidentsImpl, pollReviews, pollWaveGatesImpl, repoEnvelopeVars, startMerge, submitPr, worldRestoreSha } from "./service.ts";
 import { trackingTargetFor } from "./instanceTracking.ts";
 import type { DataLayer } from "@nanobpm/urban";
 import { READINESS_READY_MESSAGE } from "./readiness.ts";
@@ -55,6 +55,14 @@ function withGithubOff(run: () => Promise<void>): Promise<void> {
 function reviewPagesFetch(pages: Record<string, unknown>[][], requests: string[]) {
   return (url: string | URL | Request): Promise<Response> => {
     const u = new URL(String(url));
+    if (!u.pathname.endsWith("/reviews")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ head: { ref: null, sha: "SHA_CURRENT" } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
     requests.push(u.toString());
     const page = Number(u.searchParams.get("page") ?? "1");
     const headers = new Headers();
@@ -74,10 +82,11 @@ test("pollReviews publishes readiness-ready for a fresh review on the final page
     id: i + 1,
     state: "COMMENTED",
     submitted_at: "2026-09-01T00:00:00Z",
+    commit_id: "SHA_CURRENT",
   }));
   const pages = [
     oldReviews,
-    [{ id: 101, state: "APPROVED", submitted_at: "2026-09-15T12:00:00Z" }],
+    [{ id: 101, state: "APPROVED", submitted_at: "2026-09-15T12:00:00Z", commit_id: "SHA_CURRENT" }],
   ];
   const requests: string[] = [];
   const pr = {
@@ -165,6 +174,10 @@ test("re-submit of a cancelled PR marks stale open escalations", async () => {
           title: "old title",
           status: "abandoned", // terminal -> re-open path
           current_round: 3,
+          last_round_head: "stale-sha-from-prior-run",
+          last_progress_job_key: "old-job-key-from-prior-run",
+          last_progress_result: "{\"progressed\":false,\"huskRetries\":0}",
+          last_progress_agent_watermark: "999",
         }],
         key: "pr_key",
       },
@@ -196,6 +209,16 @@ test("re-submit of a cancelled PR marks stale open escalations", async () => {
     const pr = stores.pull_requests.rows[0] as Record<string, unknown>;
     assertEquals(pr.status, "converging");
     assertEquals(pr.current_round, 1);
+    // The no-progress head baseline is scoped to the prior run; a fresh run must clear it so the
+    // first addressed round is compared from a clean slate and the bounded husk retry isn't bypassed
+    // when the branch changed between runs (#786).
+    assertEquals(pr.last_round_head, null);
+    // The at-least-once replay stamp + attempt watermark are ALSO run-scoped and must be cleared so a
+    // straggler `pr.progress-check` from the prior run can't replay a stale outcome into the fresh run
+    // (Copilot PR #789).
+    assertEquals(pr.last_progress_job_key, null);
+    assertEquals(pr.last_progress_result, null);
+    assertEquals(pr.last_progress_agent_watermark, null);
     assertEquals(pr.open_escalation_id, undefined);
     assertEquals(pr.open_escalation_question, undefined);
     assertEquals(pr.process_key, "PI-9");
@@ -437,6 +460,45 @@ test("submitPr defaults convergeOnly to false so the global auto-merge default g
       prKey: "owner/repo#9",
     });
     assertEquals(get(), false);
+  });
+});
+
+// #796 auto-ack budget seeding: `submitPr` is the ONLY production write that makes the retry budget
+// available to a fresh convergence instance — the engine behaviour tests seed `ackRetryRound` /
+// `ackRetryMax` directly and never exercise `submitPr`, so a regression dropping or misconfiguring
+// this seed would leave deployed loops on the escalation default while every added behaviour test
+// still passes. Assert both the initial counter and the configured max propagate onto the instance.
+function captureVars() {
+  const stores: Record<string, { rows: unknown[]; key: string }> = {
+    pull_requests: { rows: [], key: "pr_key" },
+    escalations: { rows: [], key: "id" },
+    pr_dependencies: { rows: [], key: "pr_key" },
+  };
+  const data = {
+    table: withTrackingViews((name: string, key: string) => memTable(stores[name]?.rows ?? [], stores[name]?.key ?? key)),
+  } as any;
+  let captured: Record<string, unknown> | undefined;
+  const engine = {
+    createInstance: (req: { variables?: Record<string, unknown> }) => {
+      captured = req.variables;
+      return Promise.resolve({ processInstanceKey: "PI-1" });
+    },
+  } as any;
+  return { data, engine, get: () => captured };
+}
+
+test("submitPr seeds the #796 auto-ack budget onto the instance (ackRetryRound=0, ackRetryMax=MAX_ACK_RETRIES)", async () => {
+  await withGithubOff(async () => {
+    const { data, engine, get } = captureVars();
+    await submitPr(data, engine, {
+      repo: "owner/repo",
+      number: 10,
+      url: "https://github.com/owner/repo/pull/10",
+      prKey: "owner/repo#10",
+    });
+    const vars = get();
+    assertEquals(vars?.ackRetryRound, 0);
+    assertEquals(vars?.ackRetryMax, MAX_ACK_RETRIES);
   });
 });
 

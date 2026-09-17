@@ -23,6 +23,10 @@ export interface GhReview {
   id: number;
   state: string;
   submitted_at?: string;
+  /** The commit SHA the review was submitted against (GitHub's `commit_id`). Used to detect a
+   * review that predates the PR's current HEAD — a STALE review whose advisories are about code the
+   * head has since moved past (issue #799). Absent on data GitHub did not carry a `commit_id` for. */
+  commit_id?: string | null;
 }
 
 export type GithubTransport = "gh" | "token" | "auto";
@@ -60,21 +64,13 @@ function isGhAvailable(): Promise<boolean> {
   return ghAvailable;
 }
 
-function lastReviewPage(link: string | null): string | null {
-  return link?.match(/<([^>]+)>\s*;\s*rel="last"/i)?.[1] ?? null;
-}
-
-/** `gh api --include` prefixes the JSON body with the HTTP status line and headers. */
-function parseGhReviewPage(output: string): { reviews: GhReview[]; last: string | null } {
-  const [headers, body] = output.split(/\r?\n\r?\n/, 2);
-  if (body === undefined) throw new Error("github gh response did not include HTTP headers");
-  const link = headers.split(/\r?\n/).find((line) => /^link\s*:/i.test(line));
-  // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-  return { reviews: JSON.parse(body) as GhReview[], last: lastReviewPage(link ?? null) };
-}
-
 /** Fetch the reviews for one PR via the configured transport. Throws on transport failure so
- * the caller can log-and-continue; returns `null` when no transport is usable (idle). */
+ * the caller can log-and-continue; returns `null` when no transport is usable (idle). Pages the
+ * FULL (oldest→newest) reviews list — the poller picks the newest fresh review by id, so reading
+ * only the first `per_page=100` page would, on a >100-review convergence loop, surface the OLDEST
+ * 100 and miss the genuinely newest review (repeatedly nudging while a current-head review sits on a
+ * later page, or classifying an old review as stale). This mirrors {@link fetchLatestCopilotReview}'s
+ * paging so both readers agree on which review is newest. */
 export async function fetchPrReviews(
   repo: string,
   number: number | string,
@@ -84,22 +80,43 @@ export async function fetchPrReviews(
   const useGh = mode === "gh" || (mode === "auto" && (await isGhAvailable()));
   const path = `repos/${repo}/pulls/${number}/reviews?per_page=100`;
   if (useGh) {
-    const readPage = async (url: string) =>
-      parseGhReviewPage(await runGh(["api", url, "--include", "-H", "Accept: application/vnd.github+json"]));
-    const first = await readPage(path);
-    return first.last ? (await readPage(first.last)).reviews : first.reviews;
+    // `--paginate --slurp` walks EVERY page of the (oldest→newest) reviews array, so a >100-review
+    // convergence loop still surfaces the genuinely newest review rather than the oldest 100. Plain
+    // `--paginate` concatenates one JSON array PER PAGE (multiple documents) which `JSON.parse`
+    // cannot read; `--slurp` wraps the pages in an outer array we flatten one level (mirrors
+    // {@link githubReleasesCommand}/{@link parseReleases}).
+    const out = await runGh([
+      "api", "--paginate", "--slurp", path, "-H", "Accept: application/vnd.github+json",
+    ]);
+    // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
+    return (JSON.parse(out) as GhReview[][]).flat();
   }
   if (!token) return null; // token mode with no token → poller idles
-  const readPage = async (url: string) => {
-    const r = await fetch(url, {
+  // Page the token transport the same way; 20×100 reviews is far past any real convergence loop, and
+  // a genuinely deeper history we can't reach is unverifiable → fail CLOSED (throw) rather than
+  // return a partial list the poller would treat as complete (selecting an older review, re-nudging).
+  const reviews: GhReview[] = [];
+  const MAX_PAGES = 20;
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const r = await fetch(`https://api.github.com/${path}&page=${page}`, {
       headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" },
     });
     if (!r.ok) throw new Error(`github ${r.status} ${r.statusText}`.trim());
     // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-    return { reviews: (await r.json()) as GhReview[], last: lastReviewPage(r.headers.get("link")) };
-  };
-  const first = await readPage(`https://api.github.com/${path}`);
-  return first.last ? (await readPage(first.last)).reviews : first.reviews;
+    const batch = (await r.json()) as GhReview[];
+    reviews.push(...batch);
+    // A short final page means we've read every review — the list is complete.
+    if (batch.length < 100) return reviews;
+    // A full page on the last allowed page is only truncated if GitHub says there's more; trust the
+    // `Link` header's `rel="next"` (mirrors {@link fetchPrFiles}) so an exact multiple of 100 isn't a
+    // false positive, and throw when the cap genuinely truncates rather than under-reading history.
+    if (page === MAX_PAGES && /<[^>]*>;\s*rel="next"/.test(r.headers.get("link") ?? "")) {
+      throw new Error(
+        `github pr reviews truncated: ${repo}#${number} exceeds ${MAX_PAGES * 100}-review paging cap`,
+      );
+    }
+  }
+  return reviews;
 }
 
 // ── Review-comment convergence gate (don't converge with unaddressed comments) ──────────────
@@ -264,25 +281,59 @@ export function parseSuppressedAdvisories(reviewBody: string | null | undefined)
   return out;
 }
 
+/** The line-stable advisory keys carried by a SINGLE comment body's canonical `nano-ack: <path> ::
+ * <text>` markers. This is the SOLE recognizer of an acknowledgement, shared by `isAckThread` and
+ * `parseAckedAdvisories` so "is this an ack?" has ONE canonical implementation (derivation over
+ * duplication — no drift between the two consumers). The bare `nano-ack: <path>:<line>` form yields
+ * NOTHING here: `NEW_ACK` requires the ` :: <text>` prose (a bare `path:line` is prose-blind and
+ * would false-OPEN a new advisory re-emitted at a previously-acked line). */
+function canonicalAckKeys(body: string): string[] {
+  const keys: string[] = [];
+  ACK_MARKER.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  // biome-ignore lint/suspicious/noAssignInExpressions: canonical regex-exec accumulation loop
+  while ((m = ACK_MARKER.exec(body)) !== null) {
+    const nw = NEW_ACK.exec(m[1].trim());
+    if (nw) keys.push(advisoryStableKey(nw[1], nw[2]));
+  }
+  return keys;
+}
+
+/** True when a review thread is a DEDICATED `nano-ack:` acknowledgement thread — one whose ROOT
+ * comment (`bodies[0]`, the thread-opening comment) carries a valid canonical `nano-ack: <path> ::
+ * <text>` marker — rather than a substantive code-review thread. This is a CLASSIFICATION only: the
+ * converge gate never DROPS an unresolved thread on the strength of this predicate. An unresolved ack
+ * thread still BLOCKS convergence (it is a genuinely-open GitHub thread); the classification only
+ * routes that block onto the recoverable ack-only path — a partially-completed acknowledgement the
+ * bounded #796 auto-ack retry can finish (post-and-resolve) — instead of escalating a human. A
+ * substantive unresolved thread escalates to a human.
+ *
+ * Because the gate BLOCKS either way, this predicate is FAIL-CLOSED even under a false positive:
+ *   1. Only the canonical prose-keyed form counts (via `canonicalAckKeys`); the retired bare
+ *      `nano-ack: <path>:<line>` form does NOT — matching `parseAckedAdvisories`.
+ *   2. Only the ROOT comment is inspected — a reviewer's substantive finding is ALWAYS its thread's
+ *      root and (canonical-form) never carries this marker, so a substantive thread that merely
+ *      quotes or replies `nano-ack:` in a later comment is not mis-classified.
+ *   3. Even if a root DID quote the canonical marker mid-prose and were mis-labelled an ack, the
+ *      thread is NOT excluded — it still blocks (as ack-only), and the bounded auto-ack retry cannot
+ *      ack a non-advisory, so it escalates to a human on exhaustion. Marker presence never finalizes
+ *      the gate with an open thread (the fail-OPEN this design forecloses). */
+export function isAckThread(thread: ReviewThread): boolean {
+  const root = thread.bodies[0];
+  return root !== undefined && canonicalAckKeys(root).length > 0;
+}
+
 /** Extract the acknowledged advisory keys from a set of review threads (only RESOLVED threads
  * count — an open ack thread is not yet an acknowledgement). Returns line-stable keys (`<path>#<fp>`)
- * parsed from the `nano-ack: <path> :: <text>` form ONLY. A bare `nano-ack: <path>:<line>` marker is
- * intentionally NOT honoured: its `path:line` key is blind to the advisory prose and would false-OPEN
- * a genuinely new advisory re-emitted at a previously-acked line. The gate treats an advisory as
- * acked iff its stable key appears here. */
+ * parsed from the `nano-ack: <path> :: <text>` form ONLY (via the shared `canonicalAckKeys`). A bare
+ * `nano-ack: <path>:<line>` marker is intentionally NOT honoured: its `path:line` key is blind to the
+ * advisory prose and would false-OPEN a genuinely new advisory re-emitted at a previously-acked line.
+ * The gate treats an advisory as acked iff its stable key appears here. */
 export function parseAckedAdvisories(threads: ReviewThread[]): string[] {
   const acked = new Set<string>();
   for (const t of threads) {
     if (!t.isResolved) continue;
-    for (const body of t.bodies) {
-      ACK_MARKER.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      // biome-ignore lint/suspicious/noAssignInExpressions: canonical regex-exec accumulation loop
-      while ((m = ACK_MARKER.exec(body)) !== null) {
-        const nw = NEW_ACK.exec(m[1].trim());
-        if (nw) acked.add(advisoryStableKey(nw[1], nw[2]));
-      }
-    }
+    for (const body of t.bodies) for (const k of canonicalAckKeys(body)) acked.add(k);
   }
   return [...acked];
 }
@@ -297,36 +348,73 @@ export function pickLatestCopilotReviewBody(
   reviews: { user?: { login?: string }; body?: string }[],
   truncated: boolean,
 ): string | null {
+  const picked = pickLatestCopilotReview(reviews, truncated);
+  return picked === null ? null : picked.body;
+}
+
+/** Pick the newest Copilot review — body AND the commit SHA it was submitted against — from a
+ * reviews list (GitHub returns them oldest→newest). Semantics mirror {@link pickLatestCopilotReviewBody}
+ * exactly: `truncated = true` fails CLOSED (`null`, unverifiable); a verified-complete read with no
+ * Copilot review returns `{ body: "", commitId: null }` (a verified "no advisories"). The `commitId`
+ * lets a caller detect a review that predates the PR's current HEAD — a STALE review whose advisories
+ * are about code the head has since moved past (issue #799). Pure; unit-tested. */
+export function pickLatestCopilotReview(
+  reviews: { user?: { login?: string }; body?: string; commit_id?: string | null }[],
+  truncated: boolean,
+): { body: string; commitId: string | null } | null {
   if (truncated) return null;
   const copilot = reviews.filter((rv) => isCopilot(rv.user?.login));
-  return copilot[copilot.length - 1]?.body ?? "";
+  const latest = copilot[copilot.length - 1];
+  return { body: latest?.body ?? "", commitId: latest?.commit_id ?? null };
 }
 
 /** Fetch the latest Copilot review body for a PR (the newest review authored by the automated
  * Copilot reviewer). Returns `null` ONLY when no transport is usable (unverifiable → the worker
  * fails closed); returns `""` when transport is usable but the PR has no Copilot review yet (a
  * verified "no suppressed advisories"). Throws on a genuine transport failure. This split keeps
- * `null` from conflating "unverifiable" with "empty" and fail-OPENing the advisory dimension. */
+ * `null` from conflating "unverifiable" with "empty" and fail-OPENing the advisory dimension.
+ * Thin wrapper over {@link fetchLatestCopilotReview} (the single fetch implementation). */
 export async function fetchLatestCopilotReviewBody(
   repo: string,
   number: number | string,
   token: string,
 ): Promise<string | null> {
+  const picked = await fetchLatestCopilotReview(repo, number, token);
+  return picked === null ? null : picked.body;
+}
+
+/** Fetch the latest Copilot review — body AND the commit SHA it was submitted against — for a PR.
+ * Same null/`""`-vs-unverifiable semantics as {@link fetchLatestCopilotReviewBody} (which delegates
+ * here): `null` ONLY when no transport is usable (unverifiable → fail closed); a verified read with
+ * no Copilot review yet returns `{ body: "", commitId: null }`. The `commitId` lets the convergence
+ * gate detect a review that predates the PR's current HEAD — a STALE review whose advisories are
+ * about code the head has since moved past (issue #799) — and re-solicit a fresh review rather than
+ * block/escalate against the obsolete body. Throws on a genuine transport failure. */
+export async function fetchLatestCopilotReview(
+  repo: string,
+  number: number | string,
+  token: string,
+): Promise<{ body: string; commitId: string | null } | null> {
   const mode = githubTransport();
   const useGh = mode === "gh" || (mode === "auto" && (await isGhAvailable()));
   const basePath = `repos/${repo}/pulls/${number}/reviews?per_page=100`;
   interface Review {
     user?: { login?: string };
     body?: string;
+    commit_id?: string | null;
   }
   if (useGh) {
-    // `--paginate` merges EVERY page of the (oldest→newest) reviews array, so a >100-review
+    // `--paginate --slurp` walks EVERY page of the (oldest→newest) reviews array, so a >100-review
     // convergence loop still surfaces the genuinely newest Copilot review rather than the oldest
-    // 100 — reading only the first page here would fail-OPEN the advisory dimension.
-    const out = await runGh(["api", "--paginate", basePath, "-H", "Accept: application/vnd.github+json"]);
+    // 100 — reading only the first page here would fail-OPEN the advisory dimension. Plain
+    // `--paginate` concatenates one JSON array PER PAGE (multiple documents) which `JSON.parse`
+    // cannot read; `--slurp` wraps the pages in an outer array we flatten one level.
+    const out = await runGh([
+      "api", "--paginate", "--slurp", basePath, "-H", "Accept: application/vnd.github+json",
+    ]);
     // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-    const reviews = JSON.parse(out) as Review[];
-    return pickLatestCopilotReviewBody(reviews, false);
+    const reviews = (JSON.parse(out) as Review[][]).flat();
+    return pickLatestCopilotReview(reviews, false);
   }
   if (!token) return null;
   // Page the token transport the same way; 20×100 reviews is far past any real convergence loop, and
@@ -342,14 +430,14 @@ export async function fetchLatestCopilotReviewBody(
     const batch = (await r.json()) as Review[];
     reviews.push(...batch);
     // A short page means we've read every review — the list is complete.
-    if (batch.length < 100) return pickLatestCopilotReviewBody(reviews, false);
+    if (batch.length < 100) return pickLatestCopilotReview(reviews, false);
     // A full page on the last allowed page is only truncated if GitHub says there's more; trust the
     // `Link` header's `rel="next"` so an exact multiple of 100 isn't a false positive.
     if (page === MAX_PAGES && /<[^>]*>;\s*rel="next"/.test(r.headers.get("link") ?? "")) {
-      return pickLatestCopilotReviewBody(reviews, true);
+      return pickLatestCopilotReview(reviews, true);
     }
   }
-  return pickLatestCopilotReviewBody(reviews, false);
+  return pickLatestCopilotReview(reviews, false);
 }
 
 /** Raw GraphQL response shape for the review-threads query. */
@@ -1085,17 +1173,25 @@ export async function fetchPrFiles(
   return paths;
 }
 
-/** The PR head ref/sha for D3's trial-merge gate. `null` when no transport is usable. */
+/** The PR head ref/sha for D3's trial-merge gate. `null` when no transport is usable. `headRepo` is
+ * the head branch's OWNING repository as `owner/repo` — the FORK for a cross-repo PR, else the base
+ * repo — so a caller that resolves the head ref (e.g. the no-progress head reader, #786) queries the
+ * repository the head branch actually lives in, not the base repo (where a same-named branch would
+ * resolve to an unrelated SHA). `null` when the head repository cannot be resolved (e.g. a deleted
+ * fork). */
 export async function fetchPrHead(
   repo: string,
   number: number | string,
   token: string,
-): Promise<{ headRef: string | null; headSha: string | null; baseRef: string | null } | null> {
+): Promise<{ headRef: string | null; headSha: string | null; baseRef: string | null; headRepo: string | null } | null> {
   if (await useGh()) {
-    const out = await runGh(["pr", "view", String(number), "--repo", repo, "--json", "headRefName,headRefOid,baseRefName"]);
+    const out = await runGh(["pr", "view", String(number), "--repo", repo, "--json", "headRefName,headRefOid,baseRefName,headRepository,headRepositoryOwner"]);
     // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-    const j = JSON.parse(out) as { headRefName?: string | null; headRefOid?: string | null; baseRefName?: string | null };
-    return { headRef: j.headRefName ?? null, headSha: j.headRefOid ?? null, baseRef: j.baseRefName ?? null };
+    const j = JSON.parse(out) as { headRefName?: string | null; headRefOid?: string | null; baseRefName?: string | null; headRepository?: { name?: string | null } | null; headRepositoryOwner?: { login?: string | null } | null };
+    const owner = j.headRepositoryOwner?.login;
+    const name = j.headRepository?.name;
+    const headRepo = owner && name ? `${owner}/${name}` : null;
+    return { headRef: j.headRefName ?? null, headSha: j.headRefOid ?? null, baseRef: j.baseRefName ?? null, headRepo };
   }
   if (!token) return null;
   const r = await fetch(`https://api.github.com/repos/${repo}/pulls/${number}`, {
@@ -1103,8 +1199,29 @@ export async function fetchPrHead(
   });
   if (!r.ok) throw new Error(`github ${r.status} ${r.statusText}`.trim());
   // biome-ignore lint/plugin: runtime/framework contract boundary for external data shape
-  const j = (await r.json()) as { head?: { ref?: string | null; sha?: string | null }; base?: { ref?: string | null } };
-  return { headRef: j.head?.ref ?? null, headSha: j.head?.sha ?? null, baseRef: j.base?.ref ?? null };
+  const j = (await r.json()) as { head?: { ref?: string | null; sha?: string | null; repo?: { full_name?: string | null } | null }; base?: { ref?: string | null } };
+  return { headRef: j.head?.ref ?? null, headSha: j.head?.sha ?? null, baseRef: j.base?.ref ?? null, headRepo: j.head?.repo?.full_name ?? null };
+}
+
+/** The head commit SHA of `branch` on `repo`, read from the git-ref endpoint
+ * (`git/ref/heads/<branch>`) — the ref that GitHub updates ATOMICALLY with the push, unlike a PR
+ * object's `head.sha`, which is an asynchronously-denormalized projection that can briefly report a
+ * stale-but-valid SHA after a push. The no-progress guard (#786) reads this in preference to the PR
+ * head so a lagging PR denormalization can never fabricate a no-advance escalation. `null` when the
+ * branch does not exist (a 404) or no transport is usable; throws only on a genuine transport
+ * failure. */
+export async function fetchBranchHead(
+  repo: string,
+  branch: string,
+  token: string,
+): Promise<string | null> {
+  // Honor the documented no-transport contract at this public boundary, exactly like the sibling
+  // readers `fetchPrHead`/`fetchPrBase`: with no `gh` CLI and no token there is no usable transport,
+  // which is the idle "unknown" case → `null`, NOT an exception. The internal `branchHeadSha` still
+  // throws in that case for `ensureBaseBranch`'s callers, which treat a missing transport as a hard
+  // failure; this wrapper's `Promise<string | null>` contract promises `null` instead.
+  if (!(await useGh()) && !token) return null;
+  return branchHeadSha(repo, branch, token);
 }
 
 /** The PR's current base branch ref — the branch this PR would land *into*. `null` when no
@@ -1501,7 +1618,13 @@ function isEpicBranch(branch: string): boolean {
 /** Resolve the head commit SHA of `branch` on `repo`, or `null` when the branch does not exist
  * (a 404 from the git-ref endpoint). Throws only on a genuine transport failure. */
 async function branchHeadSha(repo: string, branch: string, token: string): Promise<string | null> {
-  const apiPath = `repos/${repo}/git/ref/heads/${branch}`;
+  // Percent-encode each ref SEGMENT (git permits `#`, `?`, spaces, etc. in a branch name) while
+  // preserving the `/` separators that git uses for hierarchical refs (`feat/x`). Interpolating the
+  // raw name would, in the direct `fetch` URL, let a `#` start a fragment (and `?` a query) — the
+  // path is truncated, the wrong ref (or a 404) is read, and the no-progress guard fails open. gh
+  // api receives the same already-encoded path.
+  const encodedBranch = branch.split("/").map(encodeURIComponent).join("/");
+  const apiPath = `repos/${repo}/git/ref/heads/${encodedBranch}`;
   if (await useGh()) {
     try {
       const out = await runGh(["api", apiPath]);

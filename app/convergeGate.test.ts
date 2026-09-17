@@ -15,9 +15,11 @@ import { assert, assertEquals, assertNotEquals, assertStringIncludes } from "#te
 import { evaluateConvergeGate } from "./convergeGate.ts";
 import {
   advisoryStableKey,
+  isAckThread,
   parseAckedAdvisories,
   parseReviewThreadsPage,
   parseSuppressedAdvisories,
+  pickLatestCopilotReview,
   pickLatestCopilotReviewBody,
   type ReviewThread,
 } from "./github.ts";
@@ -28,12 +30,15 @@ test("evaluateConvergeGate: a clean PR (no unresolved threads, no advisories) co
   const r = evaluateConvergeGate({ unresolvedThreadCount: 0, suppressedAdvisories: [], acknowledgedKeys: [] });
   assertEquals(r.convergeBlocked, false);
   assertEquals(r.convergeBlockReason, "");
+  assertEquals(r.ackOnly, false);
 });
 
 test("evaluateConvergeGate: an unresolved review thread blocks convergence", () => {
   const r = evaluateConvergeGate({ unresolvedThreadCount: 2, suppressedAdvisories: [], acknowledgedKeys: [] });
   assertEquals(r.convergeBlocked, true);
   assertStringIncludes(r.convergeBlockReason, "2 unresolved review threads");
+  // An unresolved inline thread needs the round agent's code/reply work — NOT ack-only (#796).
+  assertEquals(r.ackOnly, false);
 });
 
 test("evaluateConvergeGate: an unacknowledged suppressed advisory blocks convergence", () => {
@@ -46,6 +51,8 @@ test("evaluateConvergeGate: an unacknowledged suppressed advisory blocks converg
   assertStringIncludes(r.convergeBlockReason, "spec/a.json:613");
   // Singular noun for exactly one advisory (explicit, not "advisor" + "y/ies" concatenation).
   assertStringIncludes(r.convergeBlockReason, "1 unacknowledged suppressed advisory (");
+  // Blocked SOLELY on an unacked advisory → the recoverable, bounded-auto-ack case (#796).
+  assertEquals(r.ackOnly, true);
 });
 
 test("evaluateConvergeGate: an ACKNOWLEDGED suppressed advisory no longer blocks convergence", () => {
@@ -98,6 +105,9 @@ test("evaluateConvergeGate: reports both a thread and an advisory when both are 
   assertStringIncludes(r.convergeBlockReason, "1 unresolved review thread");
   assertStringIncludes(r.convergeBlockReason, "y.ts:20");
   assert(!r.convergeBlockReason.includes("x.ts:10"), "an acknowledged advisory must not be listed");
+  // A mix of an unresolved thread AND an unacked advisory is NOT ack-only — the thread still needs
+  // the round agent's code/reply work, so it escalates to a human as before (#796).
+  assertEquals(r.ackOnly, false);
 });
 
 // ── The parsers (app/github.ts) ─────────────────────────────────────────────
@@ -136,6 +146,122 @@ test("parseSuppressedAdvisories: returns [] when there is no suppressed block", 
   assertEquals(parseSuppressedAdvisories("## Overview\nLooks good, **file.ts:1** is fine."), []);
   assertEquals(parseSuppressedAdvisories(null), []);
   assertEquals(parseSuppressedAdvisories(undefined), []);
+});
+
+// An UNRESOLVED ack thread (one the round agent posted but has not resolved yet) must NOT count as
+// an unresolved *review* thread: it is a partially-completed acknowledgement the bounded #796
+// auto-ack retry can finish, so counting it would flip an otherwise ack-only block off the
+// recoverable path and escalate to a human despite there being no substantive open code-review
+// thread. `isAckThread` is the single source of truth the converge-gate worker filters on.
+test("isAckThread: a thread carrying a nano-ack marker is an ack thread (resolved or not)", () => {
+  assert(
+    isAckThread({
+      isResolved: false,
+      path: "a.ts",
+      bodies: ["Applied. nano-ack: app/x.ts :: Guard the empty input."],
+    }),
+  );
+  assert(
+    isAckThread({ isResolved: true, path: "a.ts", bodies: ["Declined. nano-ack: app/x.ts :: Narrow this type."] }),
+  );
+});
+
+test("isAckThread: a substantive review thread (no nano-ack marker) is NOT an ack thread", () => {
+  assertEquals(isAckThread({ isResolved: false, path: "a.ts", bodies: ["This can NPE on empty input."] }), false);
+  assertEquals(isAckThread({ isResolved: false, path: "a.ts", bodies: [] }), false);
+});
+
+// FAIL-CLOSED guard #1 — the retired bare `nano-ack: <path>:<line>` form is prose-blind and NOT
+// honoured by `parseAckedAdvisories`; classifying it as an ack thread would drop a genuine unresolved
+// thread from the count and let the gate finalize with it still open. It must stay counted.
+test("isAckThread: a bare `<path>:<line>` marker is NOT a dedicated ack thread (stays counted)", () => {
+  assertEquals(
+    isAckThread({ isResolved: false, path: "a.ts", bodies: ["Applied. nano-ack: app/x.ts:12"] }),
+    false,
+  );
+});
+
+// FAIL-CLOSED guard #2 — a substantive reviewer thread whose ROOT is the finding, with a later reply
+// merely QUOTING a canonical marker, must NOT be classified as an ack thread. Only the thread root is
+// inspected, and the root here carries no marker, so the substantive thread stays counted.
+test("isAckThread: a substantive thread that only quotes nano-ack in a reply is NOT an ack thread", () => {
+  assertEquals(
+    isAckThread({
+      isResolved: false,
+      path: "a.ts",
+      bodies: [
+        "This can NPE on empty input.",
+        "Re: your `nano-ack: app/x.ts :: Guard the empty input.` — that is unrelated to this finding.",
+      ],
+    }),
+    false,
+  );
+});
+
+// Mirrors the converge-gate worker's split: an unresolved ack thread is classified separately (it
+// still BLOCKS but stays ack-only/recoverable), while a substantive unresolved thread escalates.
+test("converge gate: an unresolved ack thread does not count as a SUBSTANTIVE thread (stays ack-only)", () => {
+  const threads: ReviewThread[] = [
+    { isResolved: false, path: "a.ts", bodies: ["Applied. nano-ack: app/x.ts :: Guard the empty input."] },
+    { isResolved: true, path: "b.ts", bodies: ["already fixed"] },
+  ];
+  const unresolved = threads.filter((t) => !t.isResolved);
+  const unresolvedAckThreadCount = unresolved.filter((t) => isAckThread(t)).length;
+  const unresolvedThreadCount = unresolved.length - unresolvedAckThreadCount;
+  assertEquals(unresolvedThreadCount, 0);
+  assertEquals(unresolvedAckThreadCount, 1);
+  const r = evaluateConvergeGate({
+    unresolvedThreadCount,
+    unresolvedAckThreadCount,
+    suppressedAdvisories: [{ key: "app/x.ts#deadbeef", label: "app/x.ts:12" }],
+    acknowledgedKeys: [],
+  });
+  assertEquals(r.convergeBlocked, true);
+  assertEquals(r.ackOnly, true);
+});
+
+// FAIL-CLOSED regression (thread 2): an unresolved ack thread with NO outstanding advisory must NOT
+// finalize the gate — dropping it entirely (the old `!isAckThread` filter) let the process converge
+// with a genuinely-open GitHub thread. It now BLOCKS, classified ack-only (recoverable).
+test("converge gate: a lone unresolved ack thread (no advisory) BLOCKS, ack-only (no fail-open finalize)", () => {
+  const threads: ReviewThread[] = [
+    { isResolved: false, path: "a.ts", bodies: ["Applied. nano-ack: app/x.ts :: Guard the empty input."] },
+  ];
+  const unresolved = threads.filter((t) => !t.isResolved);
+  const unresolvedAckThreadCount = unresolved.filter((t) => isAckThread(t)).length;
+  const unresolvedThreadCount = unresolved.length - unresolvedAckThreadCount;
+  assertEquals(unresolvedThreadCount, 0);
+  assertEquals(unresolvedAckThreadCount, 1);
+  const r = evaluateConvergeGate({
+    unresolvedThreadCount,
+    unresolvedAckThreadCount,
+    suppressedAdvisories: [],
+    acknowledgedKeys: [],
+  });
+  assertEquals(r.convergeBlocked, true);
+  assertEquals(r.ackOnly, true);
+  assertStringIncludes(r.convergeBlockReason, "unresolved acknowledgement thread");
+});
+
+// A genuine reviewer thread left open still blocks off the ack-only path (fail-closed intact).
+test("converge gate: a substantive unresolved thread still counts (not ack-only)", () => {
+  const threads: ReviewThread[] = [
+    { isResolved: false, path: "a.ts", bodies: ["This can NPE on empty input."] },
+    { isResolved: false, path: "b.ts", bodies: ["Applied. nano-ack: app/x.ts :: Guard the empty input."] },
+  ];
+  const unresolved = threads.filter((t) => !t.isResolved);
+  const unresolvedAckThreadCount = unresolved.filter((t) => isAckThread(t)).length;
+  const unresolvedThreadCount = unresolved.length - unresolvedAckThreadCount;
+  assertEquals(unresolvedThreadCount, 1);
+  assertEquals(unresolvedAckThreadCount, 1);
+  const r = evaluateConvergeGate({
+    unresolvedThreadCount,
+    unresolvedAckThreadCount,
+    suppressedAdvisories: [{ key: "app/x.ts#deadbeef", label: "app/x.ts:12" }],
+    acknowledgedKeys: [],
+  });
+  assertEquals(r.convergeBlocked, true);
+  assertEquals(r.ackOnly, false);
 });
 
 test("parseAckedAdvisories: only RESOLVED threads carrying a nano-ack marker count", () => {
@@ -432,12 +558,63 @@ test("pickLatestCopilotReviewBody: FAILS CLOSED (null) when the reviews read was
   );
 });
 
+// The COMMIT-ID-carrying picker (`pickLatestCopilotReview`) is the ONLY production path that carries
+// GitHub's `commit_id` into the stale-review guard (#799); the worker tests inject `{ commitId }`
+// directly, so without these the picker's commit_id selection could regress (disabling stale
+// detection) while every other test stays green. These lock: the NEWEST Copilot review's commit_id
+// (and body) is returned; a no-Copilot-review read is verified `{ body: "", commitId: null }`; a
+// truncated read fails closed to `null`.
+test("pickLatestCopilotReview: returns the NEWEST Copilot review's body AND commit_id (oldest\u2192newest)", () => {
+  const picked = pickLatestCopilotReview(
+    [
+      { user: { login: "human" }, body: "human review", commit_id: "humansha" },
+      { user: { login: "Copilot" }, body: "old copilot review", commit_id: "oldsha" },
+      { user: { login: "Copilot" }, body: "newest copilot review", commit_id: "newsha" },
+    ],
+    false,
+  );
+  assertEquals(picked, { body: "newest copilot review", commitId: "newsha" });
+});
+
+test('pickLatestCopilotReview: a complete read with NO Copilot review is verified { body: "", commitId: null }', () => {
+  assertEquals(pickLatestCopilotReview([{ user: { login: "human" }, body: "hi", commit_id: "x" }], false), {
+    body: "",
+    commitId: null,
+  });
+  assertEquals(pickLatestCopilotReview([], false), { body: "", commitId: null });
+});
+
+test("pickLatestCopilotReview: a Copilot review missing commit_id yields commitId null (not stale)", () => {
+  // A review with no commit_id must not fabricate a stale verdict: `isReviewStale` fails safe on a
+  // null review commit_id, and this picker must surface that null rather than an empty string.
+  assertEquals(pickLatestCopilotReview([{ user: { login: "Copilot" }, body: "b" }], false), {
+    body: "b",
+    commitId: null,
+  });
+});
+
+test("pickLatestCopilotReview: FAILS CLOSED (null) when the reviews read was TRUNCATED", () => {
+  assertEquals(pickLatestCopilotReview([{ user: { login: "Copilot" }, body: "possibly stale", commit_id: "s" }], true), null);
+});
+
 async function makeUnderTest(deps: {
   readThreads: (repo: string, n: number) => Promise<ReviewThread[] | null>;
   readReviewBody: (repo: string, n: number) => Promise<string | null>;
+  // The commit SHA the latest Copilot review was submitted against, and the PR's current HEAD SHA
+  // (issue #799). Absent ⇒ both null ⇒ never stale (the pre-#799 behaviour every existing test
+  // relies on). A stale-review test supplies a `reviewCommitId` that differs from `headSha`.
+  reviewCommitId?: string | null;
+  headSha?: string | null;
 }) {
   const { makeHandler } = await import("../workers/converge-gate/worker.ts");
-  return makeHandler(deps);
+  return makeHandler({
+    readThreads: deps.readThreads,
+    readReview: async (repo, n) => {
+      const body = await deps.readReviewBody(repo, n);
+      return body === null ? null : { body, commitId: deps.reviewCommitId ?? null };
+    },
+    readHeadSha: async () => deps.headSha ?? null,
+  });
 }
 
 test("converge-gate: a clean PR is allowed to converge", async () => {
@@ -446,7 +623,7 @@ test("converge-gate: a clean PR is allowed to converge", async () => {
     readReviewBody: async () => "## Overview\nNo suppressed block.",
   });
   const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
-  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "" });
+  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "", convergeAckOnly: false, reviewStale: false });
 });
 
 test("converge-gate: an unresolved thread blocks convergence", async () => {
@@ -457,6 +634,7 @@ test("converge-gate: an unresolved thread blocks convergence", async () => {
   const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
   assertEquals(out.convergeBlocked, true);
   assertStringIncludes(out.convergeBlockReason ?? "", "unresolved review thread");
+  assertEquals(out.convergeAckOnly, false);
 });
 
 test("converge-gate: an unacknowledged suppressed advisory blocks convergence", async () => {
@@ -467,6 +645,8 @@ test("converge-gate: an unacknowledged suppressed advisory blocks convergence", 
   const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
   assertEquals(out.convergeBlocked, true);
   assertStringIncludes(out.convergeBlockReason ?? "", "spec-app/nano-app.schema.json:613");
+  // Blocked SOLELY on unacked advisories → ack-only, so the loop auto-acks before a human (#796).
+  assertEquals(out.convergeAckOnly, true);
 });
 
 test("converge-gate: an acknowledged advisory (resolved ack thread) is allowed", async () => {
@@ -488,7 +668,56 @@ test("converge-gate: an acknowledged advisory (resolved ack thread) is allowed",
     readReviewBody: async () => SAMPLE_REVIEW_BODY,
   });
   const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
-  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "" });
+  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "", convergeAckOnly: false, reviewStale: false });
+});
+
+// WIRING regression guard (through makeHandler, not a local re-implementation of the filter): an
+// UNRESOLVED ack thread is classified separately (ack-only), so a block whose only substantive cause
+// is unacked advisories stays ack-only. If the worker regressed to counting an unresolved ack thread
+// as a SUBSTANTIVE thread, convergeAckOnly would flip to false and this handler-level test would fail.
+test("converge-gate: an unresolved ack thread is classified ack-only, not substantive (through the handler)", async () => {
+  const handler = await makeUnderTest({
+    readThreads: async () => [
+      // A partially-completed acknowledgement (posted, not yet resolved) — its root carries the
+      // canonical marker, so isAckThread classifies it as an (unresolved) ack thread, not substantive.
+      {
+        isResolved: false,
+        path: "spec-app/nano-app.schema.json",
+        bodies: [
+          "Applied. nano-ack: spec-app/nano-app.schema.json :: The description could be clearer about the loopback default.",
+        ],
+      },
+    ],
+    readReviewBody: async () => SAMPLE_REVIEW_BODY,
+  });
+  const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
+  assertEquals(out.convergeBlocked, true);
+  // No SUBSTANTIVE unresolved thread was counted → the block is ack-only (recoverable).
+  assertEquals(out.convergeAckOnly, true);
+  assertStringIncludes(out.convergeBlockReason ?? "", "unacknowledged suppressed");
+});
+
+// FAIL-CLOSED wiring guard (thread 2, through the handler): a lone UNRESOLVED ack thread with NO
+// outstanding advisory must NOT let the gate finalize. The old `!isAckThread` filter dropped it
+// entirely (unresolvedThreadCount = 0, no advisory) → convergeBlocked = false → the process could
+// converge with a genuinely-open GitHub thread. It must now BLOCK (ack-only, recoverable).
+test("converge-gate: a lone unresolved ack thread (no advisory) BLOCKS, ack-only — no fail-open finalize (through the handler)", async () => {
+  const handler = await makeUnderTest({
+    readThreads: async () => [
+      {
+        isResolved: false,
+        path: "spec-app/nano-app.schema.json",
+        bodies: [
+          "Applied. nano-ack: spec-app/nano-app.schema.json :: The description could be clearer about the loopback default.",
+        ],
+      },
+    ],
+    readReviewBody: async () => "## Overview\nNo suppressed block.",
+  });
+  const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
+  assertEquals(out.convergeBlocked, true);
+  assertEquals(out.convergeAckOnly, true);
+  assertStringIncludes(out.convergeBlockReason ?? "", "unresolved acknowledgement thread");
 });
 
 test("converge-gate: FAILS CLOSED when the threads read returns null (no transport)", async () => {
@@ -499,6 +728,8 @@ test("converge-gate: FAILS CLOSED when the threads read returns null (no transpo
   const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
   assertEquals(out.convergeBlocked, true);
   assertStringIncludes(out.convergeBlockReason ?? "", "could not verify");
+  // An unverifiable block is NOT ack-only — it must go to a human, never the auto-ack path (#796).
+  assertEquals(out.convergeAckOnly, false);
 });
 
 test("converge-gate: FAILS CLOSED when the review-body read returns null (no transport)", async () => {
@@ -544,7 +775,7 @@ test("converge-gate: a non-string prKey does not throw — resolves from repo/pr
     readReviewBody: async () => "",
   });
   const out = await handler({ variables: { repo: "o/r", prNumber: 1 } } as any, {} as any);
-  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "" });
+  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "", convergeAckOnly: false, reviewStale: false });
 });
 
 test("converge-gate: FAILS CLOSED (no throw) when prKey is non-string and repo/prNumber are absent", async () => {
@@ -568,6 +799,57 @@ test("converge-gate: resolves repo/prNumber from the prKey when the vars are abs
   });
   await handler({ variables: { prKey: "o/r#7" } } as any, {} as any);
   assertEquals(seen, ["o/r", 7]);
+});
+
+// ── Stale-review guard (issue #799) ──────────────────────────────────────────
+// FM2: when the PR HEAD has advanced past the commit the latest Copilot review was submitted
+// against, that review is stale — its suppressed advisories may already be fixed in code. The gate
+// must NOT block/escalate on it; it must signal `reviewStale` so the loop re-solicits a fresh
+// review of the current HEAD. FM1 (an applied-but-unacked advisory re-escalating forever) is
+// structurally cured by this: once the fixing commit lands, the review that still lists the
+// advisory is stale, so the gate re-solicits instead of re-blocking.
+
+test("converge-gate #799: a STALE review (commit_id predates HEAD) does not block — signals reviewStale", async () => {
+  // The review still lists an unacked suppressed advisory (would block if evaluated), but it was
+  // submitted against an OLD commit — the agent has since pushed a fix. The gate must re-solicit,
+  // not escalate.
+  const handler = await makeUnderTest({
+    readThreads: async () => [],
+    readReviewBody: async () => SAMPLE_REVIEW_BODY,
+    reviewCommitId: "oldsha1111111111111111111111111111111111",
+    headSha: "newsha2222222222222222222222222222222222",
+  });
+  const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
+  assertEquals(out, { convergeBlocked: false, convergeBlockReason: "", convergeAckOnly: false, reviewStale: true });
+});
+
+test("converge-gate #799: a HEAD-CURRENT review still blocks on an unacked advisory (control)", async () => {
+  // Same unacked advisory, but the review's commit_id MATCHES HEAD — it is fresh, so the ordinary
+  // gate runs and blocks. Proves the stale guard does not swallow a genuine block.
+  const handler = await makeUnderTest({
+    readThreads: async () => [],
+    readReviewBody: async () => SAMPLE_REVIEW_BODY,
+    reviewCommitId: "samesha33333333333333333333333333333333",
+    headSha: "samesha33333333333333333333333333333333",
+  });
+  const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
+  assertEquals(out.convergeBlocked, true);
+  assertEquals(out.reviewStale, false);
+  assertStringIncludes(out.convergeBlockReason ?? "", "spec-app/nano-app.schema.json:613");
+});
+
+test("converge-gate #799: an unknown review commit_id or unreadable HEAD is NOT stale (evaluates normally)", async () => {
+  // Fail-safe: without both SHAs we cannot prove staleness, so the gate must fall through to the
+  // ordinary evaluation (here: block on the unacked advisory), never fabricate a re-solicit loop.
+  const handler = await makeUnderTest({
+    readThreads: async () => [],
+    readReviewBody: async () => SAMPLE_REVIEW_BODY,
+    reviewCommitId: null,
+    headSha: "newsha2222222222222222222222222222222222",
+  });
+  const out = await handler({ variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1 } } as any, {} as any);
+  assertEquals(out.convergeBlocked, true);
+  assertEquals(out.reviewStale, false);
 });
 
 // ── Structural guard over the committed BPMN (no engine) ─────────────────────
@@ -602,8 +884,114 @@ test("check-converge runs the deterministic converge-gate job and feeds gw-conve
 test("gw-converge-gate blocks on an explicit convergeBlocked = true condition", () => {
   const f = flowElement("f_convergeBlocked");
   assert(f, "f_convergeBlocked flow missing");
-  assertStringIncludes(f, 'targetRef="persist-escalation-blockedcomments"');
+  // A block now routes to the bounded auto-ack gateway first (#796), not straight to the human.
+  assertStringIncludes(f, 'targetRef="gw-ack-retry"');
   assertStringIncludes(f, "convergeBlocked = true");
+});
+
+// ── Bounded agent auto-ack before human escalation (#796) ────────────────────
+// A converge-gate block whose SOLE cause is unacked suppressed advisories is recoverable by
+// re-dispatching the review-round agent to post the missing acks. gw-ack-retry sends such an
+// ack-only block back into review-round (bounded by ackRetryMax), and only a non-ack-only block
+// (an unresolved inline thread) or an exhausted budget escalates to the human wait-answer.
+
+test("gw-ack-retry routes an ack-only block (within budget) back into the review-round agent", () => {
+  const gw = flat.match(/<bpmn:exclusiveGateway\b[^>]*\bid="gw-ack-retry"[^>]*>/);
+  assert(gw, "gw-ack-retry gateway missing");
+  assertStringIncludes(gw[0], 'default="f_ackEscalate"');
+  const retry = flowElement("f_ackRetry");
+  assert(retry, "f_ackRetry flow missing");
+  assertStringIncludes(retry, 'sourceRef="gw-ack-retry"');
+  // The re-entry rejoins the loop at `capture-head` (the loop head that captures the round-entry
+  // head, #786) which then flows straight into `review-round` — so the ack-only block re-dispatches
+  // the review-round agent, freshly baselined.
+  assertStringIncludes(retry, 'targetRef="capture-head"');
+  assertStringIncludes(retry, "convergeAckOnly = true");
+  // Bounded: re-dispatch only while the ack-retry budget is not exhausted.
+  assert(/ackRetryRound &lt;= ackRetryMax|ackRetryRound <= ackRetryMax/.test(retry), "f_ackRetry must be budget-bounded");
+});
+
+test("gw-ack-retry default arm escalates to the human (threads or exhausted budget)", () => {
+  const esc = flowElement("f_ackEscalate");
+  assert(esc, "f_ackEscalate flow missing");
+  assertStringIncludes(esc, 'sourceRef="gw-ack-retry"');
+  assertStringIncludes(esc, 'targetRef="persist-escalation-blockedcomments"');
+  assert(!/conditionExpression/.test(esc), "the escalate arm is the default — no conditionExpression");
+});
+
+test("capture-head accepts the ack-retry re-entry flow", () => {
+  const task = flat.match(/<bpmn:serviceTask\b[^>]*\bid="capture-head"[^>]*>.*?<\/bpmn:serviceTask>/);
+  assert(task, "capture-head task missing");
+  assertStringIncludes(task[0], "<bpmn:incoming>f_ackRetry</bpmn:incoming>");
+});
+
+test("check-converge advances the ack-retry counter only on an ack-only block (bounded)", () => {
+  const task = flat.match(/<bpmn:serviceTask\b[^>]*\bid="check-converge"[^>]*>.*?<\/bpmn:serviceTask>/);
+  assert(task, "check-converge task missing");
+  assertStringIncludes(
+    task[0],
+    "if convergeBlocked = true and convergeAckOnly = true then ackRetryRound + 1 else ackRetryRound",
+  );
+});
+
+test("PrConvergeGateOut carries the convergeAckOnly signal for the auto-ack router", () => {
+  const shape = flat.match(/<nano:shape\b[^>]*\bid="PrConvergeGateOut"[^>]*>.*?<\/nano:shape>/);
+  assert(shape, "PrConvergeGateOut envelope missing");
+  assertStringIncludes(shape[0], 'name="convergeAckOnly"');
+});
+
+test("gw-converge-gate routes a STALE review back to persist-round (re-solicit), not to escalation (#799)", () => {
+  const f = flowElement("f_convergeStale");
+  assert(f, "f_convergeStale flow missing");
+  assertStringIncludes(f, 'sourceRef="gw-converge-gate"');
+  // A stale review re-enters the round loop via persist-round → check-progress, which parks
+  // waiting_review (the single writer) and the poller re-solicits a fresh review.
+  assertStringIncludes(f, 'targetRef="persist-round"');
+  assertStringIncludes(f, "reviewStale = true");
+  // persist-round must accept the stale re-entry as an incoming.
+  const pr = flat.match(/<bpmn:serviceTask\b[^>]*\bid="persist-round"[^>]*>.*?<\/bpmn:serviceTask>/);
+  assert(pr, "persist-round task missing");
+  assertStringIncludes(pr[0], "<bpmn:incoming>f_convergeStale</bpmn:incoming>");
+  // The gate's output envelope must declare reviewStale for the FEEL condition to read it.
+  assertStringIncludes(flat, 'id="PrConvergeGateOut"');
+  assert(
+    /<nano:shape\b[^>]*\bid="PrConvergeGateOut"[^>]*>.*?name="reviewStale".*?<\/nano:shape>/.test(flat),
+    "PrConvergeGateOut must declare reviewStale",
+  );
+});
+
+test("the round cap does NOT escalate a stale-retry round — f_guardMax is gated on reviewStale != true (#799)", () => {
+  // A stale review re-enters persist-round → check-progress → gw-guard. On the FINAL configured round
+  // the cap would escalate a human instead of soliciting a fresh review — but a stale review is not a
+  // failure to converge, it is a review of obsolete code. The round cap must therefore bypass the
+  // stale-retry path (the review-wait timeout remains the backstop against an indefinitely stalled
+  // re-solicitation).
+  const f = flowElement("f_guardMax");
+  assert(f, "f_guardMax flow missing");
+  assertStringIncludes(f, "maxRounds and reviewStale != true");
+});
+
+test("wait-review clears reviewStale when a fresh review lands, so the marker can't leak into a later round (#799)", () => {
+  // reviewStale is written ONLY by the converge-gate; once a fresh review arrives it is no longer
+  // known-stale, so wait-review resets it to false alongside the round increment. Without this reset
+  // a stale marker would persist and disable the round cap for a subsequent addressed round.
+  const wr = flat.match(/<bpmn:intermediateCatchEvent\b[^>]*\bid="wait-review"[^>]*>.*?<\/bpmn:intermediateCatchEvent>/);
+  assert(wr, "wait-review catch event missing");
+  assertStringIncludes(wr[0], '<zeebe:output source="=round + 1" target="round" />');
+  assertStringIncludes(wr[0], '<zeebe:output source="=false" target="reviewStale" />');
+});
+
+test("record-answer clears reviewStale so a human-resumed round after a review-stall timeout is re-capped (#799)", () => {
+  // reviewStale is cleared on the wait-review MESSAGE arm, but the review-wait TIMER arm bypasses it:
+  // wait-review-timeout → persist-review-stalled → wait-answer → record-answer → capture-head. A
+  // stale-retry round that times out and is resumed by a human therefore re-enters the loop still
+  // carrying reviewStale = true, which — via `f_guardMax`'s `reviewStale != true` guard — would keep
+  // the round cap disabled for that (and every subsequent) human-directed addressed round. Once a
+  // human is answering escalations the automated stale-retry is over, so record-answer must reset the
+  // marker; a genuinely-still-stale next review re-sets it at the converge-gate.
+  const task = flat.match(/<bpmn:serviceTask\b[^>]*\bid="record-answer"[^>]*>.*?<\/bpmn:serviceTask>/);
+  assert(task, "record-answer task missing");
+  assertStringIncludes(task[0], '<zeebe:output source="=false" target="reviewStale" />');
 });
 
 test("gw-converge-gate default arm routes to the scope classifier (not straight to finalize)", () => {
