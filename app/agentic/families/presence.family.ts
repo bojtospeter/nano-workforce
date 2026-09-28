@@ -19,18 +19,28 @@
 // is untouched — presence rides the agentic channel only; ADVISORY — the registry is a read-only
 // mirror and NEVER hard-locks or gates a BPMN sequence flow. Capability (cognition/weight/family/host)
 // is an ENROLMENT attribute, never a routing token.
+
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { AgenticHub, FamilyHandler, HubConnection } from "@nanobpm/agentic/channel";
 import {
   attachPresenceFamily,
   type PresenceFamilyHandle,
+  type PresenceRow,
   PresenceStore,
   type PresenceStoreOptions,
+  type RegisterInput,
   type SqliteDb,
 } from "@nanobpm/agentic/presence";
+import type { Frame, MessageFamily } from "@nanobpm/agentic/protocol";
 import type { DataLayer } from "@nanobpm/urban";
+import { HarnessProtocolRegistry } from "../../harnessProtocol.ts";
 import type { AgenticContext, AgenticFamily } from "../registry.ts";
 
 /** The message-family name this module owns (its three handlers are register/heartbeat/deregister). */
 export const PRESENCE_FAMILY = "presence";
+
+/** The presence REGISTER message family — the frame that carries the enrolment capability. */
+const REGISTER_FAMILY: MessageFamily = "register";
 
 /** The maintenance tick runs at a third of the presence TTL — matching the hub/store sweep cadence. */
 const SWEEP_DIVISOR = 3;
@@ -262,6 +272,170 @@ export function createPresenceStore(db: SqliteDb, options?: PresenceStoreOptions
   return new PresenceStore(db, options);
 }
 
+/** Read a property off an unknown value without an unsafe `as` cast (mirrors the relay/loader helper). */
+function readProp(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  return Object.hasOwn(value, key) ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined;
+}
+
+/** Read an optional advertised harness protocol off a presence REGISTER capability (issue #820).
+ *
+ * The wire capability the package validates is `{cognition, weight, family, host}` and its handler
+ * DROPS any other field, so the harness-protocol version a c8ctl-nano worker advertises over the
+ * presence channel (jwulf/c8ctl-plugin-nano#272) would never reach the ONE `worker_harness_protocol`
+ * recorder that the #802 staleness gate reads — the gate is inert for the presence-only fleet. This
+ * lifts the advertised version out of the register capability so it can be recorded. It is an
+ * ADR 0056 §7 enrolment attribute (never a routing token): a non-numeric / absent value reads back as
+ * `undefined` → the recorder stores NULL → the worker is assessed STALE (absent-version-is-stale, the
+ * #802 signature, preserved). */
+function readHarnessProtocol(payload: unknown): number | undefined {
+  const value = readProp(readProp(payload, "capability"), "harnessProtocol");
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * Wrap `hub` so that the presence REGISTER handler the package installs ALSO records the advertised
+ * harness protocol into the ONE canonical {@link HarnessProtocolRegistry} (issue #820) — the same
+ * table the HTTP `enrolAgenticWorker` door writes and `assessWorkers` reads (derivation over
+ * duplication, not a second store). Every other family passes through untouched.
+ *
+ * The record is gated on the register having actually TAKEN EFFECT — NOT merely on who owns the row
+ * afterwards. A bare "is the row now owned by this connection?" check is insufficient: a rejected or
+ * malformed RE-register from the connection that ALREADY owns the instance leaves the prior row in
+ * place, so that check still passes and would record the rejected frame's protocol (often `undefined`)
+ * — silently clearing a healthy protocol without any successful enrolment. The package accepts a
+ * register by calling {@link PresenceStore.register} exactly once and rejects it (a malformed payload,
+ * or an ownership takeover of an instance bound to a different identity) by dropping the frame WITHOUT
+ * touching the store. So we wrap `store.register` to flip an acceptance flag bound — via
+ * {@link AsyncLocalStorage} — to the exact recording invocation whose handler triggered it, and record
+ * only when THIS frame's flag is set: an explicit, per-invocation acceptance signal, not an inferred
+ * one.
+ *
+ * The binding must be per-invocation, NOT a shared per-instance marker: the recording wrapper `await`s
+ * the package handler, so two REGISTER frames for the same instance can be in flight at once. A shared
+ * "accepted generation" counter compared before/after the await would MIS-ATTRIBUTE — a rejected frame
+ * that snapshots the counter, parks on its await while a concurrent ACCEPTED frame for the same
+ * instance advances the counter, then resumes to see it changed and records its own absent/invalid
+ * protocol, clearing a healthy value. AsyncLocalStorage carries each frame's flag through its own await
+ * chain, so a concurrent frame runs in a DISTINCT context and can never flip this frame's flag. It also
+ * holds NO per-instance state, so nothing accumulates for deregistered / TTL-swept / ephemeral
+ * instances (an earlier per-instance `Map` leaked an entry per distinct instance forever). (An even
+ * earlier before/after `lastSeen` comparison could also FALSE-NEGATIVE two accepted same-connection
+ * re-registers within one `Date.now()` tick — identical millisecond timestamps read as "no change".)
+ * That skips every register the package dropped, so neither a foreign peer nor a self-inflicted bad
+ * frame can rewrite a worker's recorded protocol. Two ACCEPTED re-registers for one instance can also
+ * be in flight at once (a reconnect race), and the record write is async; the writes are SERIALIZED
+ * per instance and stamped with the monotonic acceptance sequence, so a stale (older) frame resuming
+ * last is skipped rather than overwriting the newer protocol — the newest accepted protocol always
+ * wins. Recording is best-effort: a registry write hiccup is
+ * logged and swallowed, exactly like the presence sweep, and never fails the register.
+ */
+function withHarnessProtocolRecording(
+  hub: AgenticHub,
+  store: PresenceStore,
+  data: DataLayer,
+  log: AgenticContext["log"],
+): AgenticHub {
+  const registry = new HarnessProtocolRegistry(data);
+  // An acceptance flag bound to the CURRENT recording invocation (AsyncLocalStorage, not a shared
+  // per-instance counter): the package handler calls store.register exactly on an accepted frame, so
+  // flipping THIS invocation's flag inside the wrapped register makes acceptance observable without a
+  // before/after comparison that could either collide within one Date.now() tick or be cross-attributed
+  // to a concurrent frame for the same instance across the await. It also keeps no per-instance state,
+  // so nothing leaks for deregistered / TTL-swept instances.
+  const acceptance = new AsyncLocalStorage<{ accepted: boolean; seq: number }>();
+  let acceptSeq = 0;
+  const registerInner = store.register.bind(store);
+  store.register = (input: RegisterInput): PresenceRow => {
+    const row = registerInner(input);
+    const active = acceptance.getStore();
+    // Stamp a monotonic acceptance SEQUENCE at the synchronous register call: it reflects the true
+    // order in which the store accepted overlapping re-registers, which the async record write below
+    // must preserve.
+    if (active) {
+      active.accepted = true;
+      active.seq = ++acceptSeq;
+    }
+    return row;
+  };
+  // Per-instance serialized write chains. Two ACCEPTED re-registers for one instance can be in flight
+  // at once (a reconnect race on the owner), and `recordEnrolment` is async (findOne → update), so
+  // their writes could otherwise interleave and land out of order — the OLDER frame resuming last and
+  // overwriting the NEWER protocol, leaving the supply assessment stale until the next register.
+  // Serialize the writes per instance AND skip any write whose acceptance sequence is stale (a newer
+  // accepted register already applied), so the newest accepted protocol always wins regardless of
+  // completion timing. The entry is dropped once its chain drains, so — like the per-invocation marker
+  // — nothing accumulates for deregistered / TTL-swept / ephemeral instances.
+  const writeChains = new Map<string, { tail: Promise<void>; lastSeq: number; pending: number }>();
+  const recordInOrder = (instance: string, seq: number, protocol: number | undefined): Promise<void> => {
+    let chain = writeChains.get(instance);
+    if (chain === undefined) {
+      chain = { tail: Promise.resolve(), lastSeq: 0, pending: 0 };
+      writeChains.set(instance, chain);
+    }
+    const c = chain;
+    c.pending++;
+    const run = c.tail.then(async () => {
+      // A newer accepted register (higher seq) already applied — this frame's write is stale, so skip
+      // it rather than clobber the fresher protocol with an out-of-order value.
+      if (seq <= c.lastSeq) return;
+      c.lastSeq = seq;
+      await registry.recordEnrolment(instance, protocol);
+    });
+    // Keep the chain live even if one write rejects (a rejection must not wedge later writes), and drop
+    // the per-instance entry once the last queued write drains.
+    c.tail = run
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        if (--c.pending === 0 && writeChains.get(instance) === c) writeChains.delete(instance);
+      });
+    return run;
+  };
+  return new Proxy(hub, {
+    get(target, prop, receiver) {
+      if (prop !== "registerFamilyHandler") {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return (family: MessageFamily, handler: FamilyHandler<HubConnection>) => {
+        if (family !== REGISTER_FAMILY) {
+          target.registerFamilyHandler(family, handler);
+          return;
+        }
+        const recording: FamilyHandler<HubConnection> = async (frame: Frame, conn: HubConnection) => {
+          const instance = readInstance(frame.payload);
+          // Run the package handler inside a fresh acceptance context. store.register — called by the
+          // handler exactly when it ACCEPTS this frame — flips THIS marker; a REJECTED frame (malformed
+          // or an ownership takeover the handler drops without touching the store) leaves it false. The
+          // marker travels with this frame's own async chain, so a concurrent frame for the same
+          // instance runs in a distinct context and can never flip it across the await.
+          const marker = { accepted: false, seq: 0 };
+          await acceptance.run(marker, () => handler(frame, conn));
+          if (instance === undefined) return;
+          // Record only when the package accepted THIS frame's register. A rejected re-register leaves
+          // the marker false, so it records nothing and cannot clear a healthy protocol.
+          if (!marker.accepted) return;
+          try {
+            await recordInOrder(instance, marker.seq, readHarnessProtocol(frame.payload));
+          } catch (err) {
+            log.warn("agentic presence: harness-protocol record failed", { instance, err: String(err) });
+          }
+        };
+        target.registerFamilyHandler(family, recording);
+      };
+    },
+  });
+}
+
+/** The `register.instance` off a presence payload, or undefined when absent/blank. */
+function readInstance(payload: unknown): string | undefined {
+  const value = readProp(payload, "instance");
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 /**
  * The presence family module. `mount` attaches register/heartbeat/deregister to the hub, applies the
  * schema, and starts ONE canonical maintenance tick that both ages out on the presence TTL and drops
@@ -271,8 +445,9 @@ export const family: AgenticFamily = {
   name: PRESENCE_FAMILY,
 
   mount(ctx: AgenticContext): void {
-    const db = openPresenceDb(ctx.data);
-    if (!db) {
+    const data = ctx.data;
+    const db = openPresenceDb(data);
+    if (!db || !data) {
       ctx.log.warn("agentic presence: no data layer mounted — presence registry disabled");
       return;
     }
@@ -284,12 +459,18 @@ export const family: AgenticFamily = {
 
     // Attach the three presence handlers via the S1 seam. Disable the package's own TTL timer
     // (`sweepIntervalMs: 0`) so this module runs a SINGLE maintenance loop rather than two — the
-    // canonical presence-maintenance pass, not a second poller (derivation over duplication).
-    const handle = attachPresenceFamily(ctx.hub, store, {
-      sweepIntervalMs: 0,
-      onError: (err, connectionId) =>
-        ctx.log.warn("agentic presence fault", { connectionId, err: String(err) }),
-    });
+    // canonical presence-maintenance pass, not a second poller (derivation over duplication). The hub
+    // is wrapped so the REGISTER handler ALSO records the advertised harness protocol into the ONE
+    // canonical registry (issue #820) — the presence-channel path to the #802 staleness gate.
+    const handle = attachPresenceFamily(
+      withHarnessProtocolRecording(ctx.hub, store, data, ctx.log),
+      store,
+      {
+        sweepIntervalMs: 0,
+        onError: (err, connectionId) =>
+          ctx.log.warn("agentic presence fault", { connectionId, err: String(err) }),
+      },
+    );
 
     const interval = Math.max(1, Math.floor(store.ttlMs / SWEEP_DIVISOR));
     const tick = () => {

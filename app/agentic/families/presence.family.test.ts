@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { AgenticHub } from "@nanobpm/agentic/channel";
 import type {
@@ -22,6 +23,8 @@ import { encodeFrame, type Frame, type MessageFamily } from "@nanobpm/agentic/pr
 import type { SqliteDb } from "@nanobpm/agentic/presence";
 import type { DataLayer } from "@nanobpm/urban";
 import { assert, assertEquals } from "#test-assert";
+import { assessWorkers } from "../../harnessProtocol.ts";
+import { memDataFor } from "../../../test/worldDb.ts";
 import { noopLog } from "../../../test/log.ts";
 import type { AgenticContext } from "../registry.ts";
 import {
@@ -45,11 +48,6 @@ function memSqlite(): SqliteDb {
     all: <T = Record<string, unknown>>(sql: string, params: unknown[] = []) =>
       db.prepare(sql).all(...(params as never[])) as T[],
   };
-}
-
-/** A DataLayer whose default source exposes the given synchronous SqliteDb (nothing else is used). */
-function memData(db: SqliteDb): DataLayer {
-  return { source: () => ({ db }) } as unknown as DataLayer;
 }
 
 /** A mutable fake clock so TTL sweeps are deterministic. */
@@ -275,7 +273,72 @@ function familyFrame(fam: MessageFamily, instance: string): Frame {
   return { lane: "control", family: fam, seq: 1, payload: { instance } };
 }
 
-async function mountFamily(db: SqliteDb | undefined): Promise<{ hub: AgenticHub; transport: ReturnType<typeof memTransport> }> {
+/** A full in-memory DataLayer for the presence family: the synchronous `source().db` handle the
+ * presence store uses PLUS the `table()`/`open()` surface the harness-protocol registry writes
+ * through (#820), all over ONE real SQLite db with the `worker_harness_protocol` migration applied. */
+function memMountData(): DataLayer {
+  const { data, db } = memDataFor(["107_worker_harness_protocol.sql"]);
+  const sqlite: SqliteDb = {
+    exec: (sql) => db.exec(sql),
+    run: (sql, params = []) => {
+      const r = db.prepare(sql).run(...(params as never[]));
+      return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
+    },
+    all: <T = Record<string, unknown>>(sql: string, params: unknown[] = []) =>
+      db.prepare(sql).all(...(params as never[])) as T[],
+  };
+  return { ...(data as unknown as Record<string, unknown>), source: () => ({ db: sqlite }) } as unknown as DataLayer;
+}
+
+/** Wrap a DataLayer so every `harness_protocol` value written through the registry's `table` seam is
+ * appended to `writes`, in order. Lets a test observe WHICH register frames actually recorded — a
+ * concurrent rejected frame that (wrongly) records surfaces as an extra `null` write, independent of
+ * which write happens to land last. */
+function withProtocolWriteSpy(data: DataLayer): { data: DataLayer; writes: Array<number | null> } {
+  const writes: Array<number | null> = [];
+  const realTable = (data as unknown as { table: (name: string, key: string) => unknown }).table.bind(data);
+  const wrapped = {
+    ...(data as unknown as Record<string, unknown>),
+    table: (name: string, key: string) => {
+      const t = realTable(name, key) as Record<string, (...a: unknown[]) => unknown>;
+      if (name !== "worker_harness_protocol") return t;
+      const note = (v: unknown) => writes.push(typeof v === "number" ? v : null);
+      return {
+        ...t,
+        insert: (row: Record<string, unknown>) => { note(row.harness_protocol); return t.insert(row); },
+        update: (k: unknown, patch: Record<string, unknown>) => { note(patch.harness_protocol); return t.update(k, patch); },
+      };
+    },
+  };
+  return { data: wrapped as unknown as DataLayer, writes };
+}
+
+/** Wrap a DataLayer so the registry's `update` of `worker_harness_protocol` to a specific protocol
+ * value is deferred by one MACROTASK (`setTimeout(0)`). The in-memory gateway resolves its reads/writes
+ * on microtasks, so a macrotask deterministically lands AFTER a concurrent frame's whole write —
+ * letting a test force an OLDER accepted re-register's write to complete last, the exact out-of-order
+ * hazard the per-instance serialization guards against. */
+function withDelayedProtocolUpdate(data: DataLayer, delayValue: number): DataLayer {
+  const realTable = (data as unknown as { table: (name: string, key: string) => unknown }).table.bind(data);
+  return {
+    ...(data as unknown as Record<string, unknown>),
+    table: (name: string, key: string) => {
+      const t = realTable(name, key) as Record<string, (...a: unknown[]) => unknown>;
+      if (name !== "worker_harness_protocol") return t;
+      return {
+        ...t,
+        update: async (k: unknown, patch: Record<string, unknown>) => {
+          if (Number(patch.harness_protocol) === delayValue) {
+            await new Promise<void>((r) => setImmediate(r));
+          }
+          return t.update(k, patch);
+        },
+      };
+    },
+  } as unknown as DataLayer;
+}
+
+async function mountFamily(data: DataLayer | undefined): Promise<{ hub: AgenticHub; transport: ReturnType<typeof memTransport> }> {
   const transport = memTransport();
   const hub = new AgenticHub({ transport: transport.transport, authenticator, sweepIntervalMs: 0 });
   const ctx: AgenticContext = {
@@ -283,7 +346,7 @@ async function mountFamily(db: SqliteDb | undefined): Promise<{ hub: AgenticHub;
     registry: hub.registry,
     // The transport handle is not exercised by the presence family; the in-memory one stands in.
     transport: transport.transport as never,
-    data: db ? memData(db) : undefined,
+    data,
     log: noopLog(),
   };
   await family.mount(ctx);
@@ -291,7 +354,7 @@ async function mountFamily(db: SqliteDb | undefined): Promise<{ hub: AgenticHub;
 }
 
 test("family: mount attaches the three handlers and a REGISTER creates a durable presence row", async () => {
-  const { hub, transport } = await mountFamily(memSqlite());
+  const { hub, transport } = await mountFamily(memMountData());
   try {
     assertEquals(hub.router.families().sort(), ["deregister", "heartbeat", "register"]);
 
@@ -315,7 +378,7 @@ test("family: mount attaches the three handlers and a REGISTER creates a durable
 });
 
 test("family: HEARTBEAT keeps a worker and DEREGISTER removes it", async () => {
-  const { hub, transport } = await mountFamily(memSqlite());
+  const { hub, transport } = await mountFamily(memMountData());
   try {
     const peer = fakeConn("c1", "leaf");
     transport.connect(peer.conn);
@@ -338,7 +401,7 @@ test("family: HEARTBEAT keeps a worker and DEREGISTER removes it", async () => {
 });
 
 test("family: a disconnect removes the worker via reconcile", async () => {
-  const { hub, transport } = await mountFamily(memSqlite());
+  const { hub, transport } = await mountFamily(memMountData());
   try {
     const peer = fakeConn("c1", "leaf");
     transport.connect(peer.conn);
@@ -361,7 +424,7 @@ test("family: a disconnect removes the worker via reconcile", async () => {
 });
 
 test("family: teardown stops the family and clears the current registry", async () => {
-  const { hub } = await mountFamily(memSqlite());
+  const { hub } = await mountFamily(memMountData());
   assert(currentPresenceRegistry(), "mounted");
   family.teardown?.();
   assertEquals(currentPresenceRegistry(), undefined, "cleared on teardown");
@@ -374,6 +437,247 @@ test("family: mounting without a DataLayer is a safe no-op", async () => {
     assertEquals(currentPresenceRegistry(), undefined, "no registry without data");
     // The three presence handlers are not attached when there is nothing to persist to.
     assertEquals(hub.router.families(), []);
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+// ── harness-protocol recording over the presence channel (issue #820) ──────────────────────────
+//
+// The #802 staleness gate only ever read the HTTP-enrol recorder, so a presence-only c8ctl-nano
+// fleet reported `harnessStale: true` permanently. These tests prove the presence REGISTER path now
+// feeds the ONE canonical `worker_harness_protocol` recorder the supply assessment joins.
+
+test("family: a REGISTER advertising harnessProtocol records it → the worker is assessed healthy", async () => {
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const peer = fakeConn("c1", "leafA");
+    transport.connect(peer.conn);
+    await flush();
+    // A presence-channel worker advertising the protocol on its enrolment capability (#820).
+    peer.feed(registerFrame("w1", { family: "opus", host: "boxA", harnessProtocol: 1 }));
+    await flush();
+
+    // Recorded into the ONE registry, keyed by instance, and joined by the shared supply assessment
+    // (default min protocol 1) → not stale.
+    const assessment = await assessWorkers(data, ["w1"], {});
+    assertEquals(assessment.get("w1")?.harnessProtocol, 1, "advertised protocol recorded");
+    assertEquals(assessment.get("w1")?.stale, false, "advertising min protocol clears the #802 stale flag");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: a REGISTER advertising NO harnessProtocol stays stale (no #802 regression)", async () => {
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const peer = fakeConn("c1", "leafA");
+    transport.connect(peer.conn);
+    await flush();
+    peer.feed(registerFrame("w1", { family: "opus", host: "boxA" }));
+    await flush();
+
+    const assessment = await assessWorkers(data, ["w1"], {});
+    assertEquals(assessment.get("w1")?.harnessProtocol, undefined, "no version advertised");
+    assertEquals(assessment.get("w1")?.stale, true, "absent version is stale — the #802 signal is preserved");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: a below-minimum harnessProtocol is assessed stale against a raised minimum", async () => {
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const peer = fakeConn("c1", "leafA");
+    transport.connect(peer.conn);
+    await flush();
+    peer.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+
+    const assessment = await assessWorkers(data, ["w1"], { NANO_AGENTIC_MIN_HARNESS_PROTOCOL: "2" });
+    assertEquals(assessment.get("w1")?.harnessProtocol, 1, "advertised protocol recorded");
+    assertEquals(assessment.get("w1")?.stale, true, "below the raised minimum is stale");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: a rejected takeover REGISTER cannot overwrite another peer's recorded protocol", async () => {
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    // Owner registers instance w1 with a healthy protocol.
+    const owner = fakeConn("c1", "owner");
+    transport.connect(owner.conn);
+    await flush();
+    owner.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+    assertEquals((await assessWorkers(data, ["w1"], {})).get("w1")?.stale, false, "owner recorded healthy");
+
+    // A different identity tries to take over w1 advertising no version — the presence store rejects
+    // the ownership takeover, so the recording must NOT clear the owner's healthy protocol.
+    const attacker = fakeConn("c2", "attacker");
+    transport.connect(attacker.conn);
+    await flush();
+    attacker.feed(registerFrame("w1", {}));
+    await flush();
+
+    const assessment = await assessWorkers(data, ["w1"], {});
+    assertEquals(assessment.get("w1")?.harnessProtocol, 1, "owner's recorded protocol survives a rejected takeover");
+    assertEquals(assessment.get("w1")?.stale, false, "no foreign peer can flip a worker stale");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: a rejected re-register from the SAME connection cannot clear its own recorded protocol", async () => {
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    // The worker registers healthily on its connection.
+    const peer = fakeConn("c1", "leafA");
+    transport.connect(peer.conn);
+    await flush();
+    peer.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+    assertEquals((await assessWorkers(data, ["w1"], {})).get("w1")?.stale, false, "recorded healthy");
+
+    // The SAME connection now sends a MALFORMED re-register (a non-object capability). The package
+    // handler rejects it and leaves the prior row in place — so a bare "this connection owns the row"
+    // check would still pass and clobber the healthy protocol with the rejected frame's absent value.
+    // The before/after acceptance check must skip a register that never took effect.
+    const malformed: Frame = { lane: "control", family: "register", seq: 1, payload: { instance: "w1", capability: "garbage" } };
+    peer.feed(malformed);
+    await flush();
+
+    const assessment = await assessWorkers(data, ["w1"], {});
+    assertEquals(assessment.get("w1")?.harnessProtocol, 1, "rejected re-register does not clear the recorded protocol");
+    assertEquals(assessment.get("w1")?.stale, false, "a rejected frame cannot flip a live worker stale");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: two ACCEPTED same-connection re-registers in one clock tick both record their protocol", async () => {
+  // `lastSeen` is a millisecond timestamp, so two accepted REGISTERs on the same connection that
+  // arrive within one `Date.now()` tick share an identical `lastSeen`. An acceptance check that
+  // inferred "took effect" from a before/after `lastSeen` change would read the second (valid)
+  // re-register as a no-op and never record its protocol — a same-connection protocol upgrade would
+  // silently keep the old value. Freeze the clock so both registers land on the SAME tick and prove
+  // the upgrade is still recorded. (Reproduces the round-3 review finding; red under the old
+  // lastSeen-comparison code, green with the explicit accepted-register signal.)
+  mock.timers.enable({ apis: ["Date"], now: 1_700_000_000_000 });
+  const data = memMountData();
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const peer = fakeConn("c1", "leafA");
+    transport.connect(peer.conn);
+    await flush();
+
+    // First accepted register: protocol 1.
+    peer.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+    assertEquals((await assessWorkers(data, ["w1"], {})).get("w1")?.harnessProtocol, 1, "first protocol recorded");
+
+    // Second accepted re-register from the SAME connection, upgrading to protocol 2 — WITHOUT
+    // advancing the frozen clock, so its `lastSeen` is byte-identical to the first register's.
+    peer.feed(registerFrame("w1", { harnessProtocol: 2 }));
+    await flush();
+
+    const assessment = await assessWorkers(data, ["w1"], {});
+    assertEquals(assessment.get("w1")?.harnessProtocol, 2, "same-tick accepted re-register records its upgraded protocol");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+    mock.timers.reset();
+  }
+});
+
+test("family: a rejected REGISTER concurrent with an accepted one for the same instance records only the accepted protocol", async () => {
+  // The recording wrapper `await`s the package handler, so two REGISTER frames for the SAME instance
+  // can be in flight at once (e.g. a foreign takeover on one connection racing a genuine re-register
+  // on the owner's). A shared per-instance "accepted generation" counter mis-attributes here: the
+  // rejected frame snapshots the counter, parks on its await while the concurrent ACCEPTED frame
+  // advances it, then resumes to see it changed and records its OWN absent protocol — a spurious
+  // `null` write that can clear a healthy value. The acceptance signal must be bound per-invocation
+  // (AsyncLocalStorage), so a concurrent frame can never flip THIS frame's flag. Assert it directly:
+  // during the overlapping pair, the ONLY value recorded is the accepted frame's — no clearing `null`
+  // write from the rejected frame. (Red under the shared-counter code, which writes `[null, 2]`;
+  // green with the per-invocation binding, which writes `[2]`.)
+  const { data, writes } = withProtocolWriteSpy(memMountData());
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const owner = fakeConn("c1", "owner");
+    const attacker = fakeConn("c2", "attacker");
+    transport.connect(owner.conn);
+    transport.connect(attacker.conn);
+    await flush();
+
+    // Owner registers w1 healthily (protocol 1).
+    owner.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+    assertEquals(writes, [1], "initial register records protocol 1");
+    writes.length = 0;
+
+    // Overlapping pair, fed WITHOUT a flush between so both are in flight across the await: a foreign
+    // takeover (rejected by ownership, no protocol) and the owner's accepted re-register to protocol 2.
+    attacker.feed(registerFrame("w1", {}));
+    owner.feed(registerFrame("w1", { harnessProtocol: 2 }));
+    await flush();
+    await flush();
+
+    // Only the accepted frame recorded; the rejected frame contributed no clearing `null` write.
+    assertEquals(writes, [2], "only the accepted re-register records; the rejected frame records nothing");
+    assertEquals((await assessWorkers(data, ["w1"], {})).get("w1")?.harnessProtocol, 2, "recorded protocol is the accepted upgrade");
+  } finally {
+    family.teardown?.();
+    await hub.close();
+  }
+});
+
+test("family: two overlapping ACCEPTED re-registers record the NEWEST protocol even if the older write lands last", async () => {
+  // Two ACCEPTED re-registers for the same instance can be in flight at once (a reconnect race on the
+  // owner). `recordEnrolment` is async (findOne → update), so if the OLDER frame's write resumes AFTER
+  // the newer frame's, the older protocol overwrites the newer one — leaving the supply assessment
+  // stale until the next register. The recording must serialize per instance and honour acceptance
+  // order so the NEWEST accepted protocol always wins. Force the hazard deterministically: delay the
+  // older frame's (protocol 2) update by one macrotask so, unguarded, it lands after the newer
+  // (protocol 3) write. (Red under the un-serialized code, which persists the stale 2; green with the
+  // per-instance serialization + acceptance-sequence guard, which persists 3.)
+  const data = withDelayedProtocolUpdate(memMountData(), 2);
+  const { hub, transport } = await mountFamily(data);
+  try {
+    const owner = fakeConn("c1", "owner");
+    transport.connect(owner.conn);
+    await flush();
+
+    // Initial accepted register: protocol 1 (an insert, so the later updates are the ones that race).
+    owner.feed(registerFrame("w1", { harnessProtocol: 1 }));
+    await flush();
+    assertEquals((await assessWorkers(data, ["w1"], {})).get("w1")?.harnessProtocol, 1, "initial protocol recorded");
+
+    // Overlapping accepted re-registers, fed WITHOUT a flush between so both are in flight across the
+    // await: protocol 2 (older) then protocol 3 (newer). The newest accepted protocol must win.
+    owner.feed(registerFrame("w1", { harnessProtocol: 2 }));
+    owner.feed(registerFrame("w1", { harnessProtocol: 3 }));
+    await flush();
+    await flush();
+    await flush();
+
+    assertEquals(
+      (await assessWorkers(data, ["w1"], {})).get("w1")?.harnessProtocol,
+      3,
+      "the newest accepted re-register wins even when the older frame's write completes last",
+    );
   } finally {
     family.teardown?.();
     await hub.close();
