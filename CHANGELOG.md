@@ -1,3 +1,9 @@
+## [0.192.0](https://github.com/nanobpm/nano-workforce/compare/v0.191.1...v0.192.0) (2026-09-28)
+
+### Features
+
+* **world:** self-heal a no-advance round onto a reachable push-checkpoint ([#819](https://github.com/nanobpm/nano-workforce/issues/819)) ([891add2](https://github.com/nanobpm/nano-workforce/commit/891add2a217042dd2abaa37c8f12b1f1877c89fc)), closes [26/#28](https://github.com/26/nano-workforce/issues/28) [#818](https://github.com/nanobpm/nano-workforce/issues/818) [#818](https://github.com/nanobpm/nano-workforce/issues/818) [#818](https://github.com/nanobpm/nano-workforce/issues/818) [704/#497](https://github.com/704/nano-workforce/issues/497)
+
 ## [0.191.1](https://github.com/nanobpm/nano-workforce/compare/v0.191.0...v0.191.1) (2026-09-26)
 
 ### Bug Fixes
