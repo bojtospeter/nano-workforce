@@ -1,3 +1,9 @@
+## [0.193.0](https://github.com/nanobpm/nano-workforce/compare/v0.192.0...v0.193.0) (2026-09-28)
+
+### Features
+
+* **agentic:** record harnessProtocol from the presence channel ([#821](https://github.com/nanobpm/nano-workforce/issues/821)) ([304b241](https://github.com/nanobpm/nano-workforce/commit/304b241f8b875bd9eca18da102090b0256b7ead7)), closes [#802](https://github.com/nanobpm/nano-workforce/issues/802) [jwulf/c8ctl-plugin-nano#272](https://github.com/jwulf/c8ctl-plugin-nano/issues/272) [#820](https://github.com/nanobpm/nano-workforce/issues/820)
+
 ## [0.192.0](https://github.com/nanobpm/nano-workforce/compare/v0.191.1...v0.192.0) (2026-09-28)
 
 ### Features
