@@ -17,9 +17,11 @@
 // transient GitHub hiccup can never fabricate a no-progress escalation.
 import type { AgentInstanceSummary, AppApi, AppJobHandler } from "@nanobpm/urban";
 import { type HeadReader, makeDefaultReadHead } from "../../app/currentHead.ts";
-import { fetchBranchHead, fetchPrHead } from "../../app/github.ts";
+import { compareCommits, fetchBranchHead, fetchPrHead, updateBranchRef } from "../../app/github.ts";
 import { decideProgress, isAddressedStatus } from "../../app/roundProgress.ts";
 import { parsePr } from "../../app/service.ts";
+import { WorldStore } from "../../app/world/index.ts";
+import { attemptNoAdvanceSelfHeal, type SelfHealResult } from "../../app/world/selfHeal.ts";
 import type { WorkerInputs, WorkerOutputs } from "../../nano-generated/worker-io.d.ts";
 
 // Input/output typed off the model data envelopes (`PrProgressCheckIn` / `PrProgressCheckOut` in
@@ -74,6 +76,45 @@ function normalizeAgentWork(raw: boolean | null | AgentWorkObservation | undefin
 export { type HeadReader, makeDefaultReadHead };
 
 const defaultReadHead: HeadReader = makeDefaultReadHead({ fetchPrHead, fetchBranchHead });
+
+/** Attempt the no-advance self-heal (#818): reconcile a recorded push-checkpoint against the PR head
+ * and fast-forward the head onto it when safe. Injectable so tests never touch git/network; the
+ * default binds the real `WorldStore` (over `app.data`) + GitHub transport with the env credential
+ * (the same `process.env.GITHUB_TOKEN` default the head reader uses). See {@link
+ * ../../app/world/selfHeal.ts}. */
+export type SelfHealFn = (
+  app: AppApi,
+  repo: string,
+  prNumber: number,
+  prKey: string,
+  currentHead: string,
+  roundNo: number,
+  processKey: string | null,
+  stillOwns: () => Promise<boolean>,
+) => Promise<SelfHealResult>;
+
+const defaultSelfHeal: SelfHealFn = (app, repo, prNumber, prKey, currentHead, roundNo, processKey, stillOwns) => {
+  const tok = process.env.GITHUB_TOKEN ?? "";
+  const store = new WorldStore(app.data);
+  return attemptNoAdvanceSelfHeal(
+    {
+      lastCheckpoint: (pk, run, rn) => store.lastCheckpointForRun(pk, run, rn),
+      prHead: async (r, n) => {
+        const h = await fetchPrHead(r, n, tok);
+        return h ? { headRef: h.headRef, headRepo: h.headRepo } : null;
+      },
+      compare: (r, base, head) => compareCommits(r, base, head, tok),
+      advanceHead: (r, branch, sha, expected) => updateBranchRef(r, branch, sha, tok, expected),
+      stillOwns,
+    },
+    repo,
+    prNumber,
+    prKey,
+    currentHead,
+    roundNo,
+    processKey,
+  );
+};
 
 /** An agent-instance is "durable work" for husk purposes once it has reached a terminal state — it
  * carries a `completionDate`, or a terminal lifecycle status. A husked instance never closes (it is
@@ -203,6 +244,7 @@ function agentWorkFromEngine(engine: AppApi["engine"]): AgentWorkReader {
 export function makeHandler(deps: {
   readHead: HeadReader;
   readAgentWork?: AgentWorkReader;
+  selfHeal?: SelfHealFn;
 }): AppJobHandler<In, Out> {
   return async (job, app) => {
     const { prKey, status, repo, prNumber, round, huskRetries, roundEntryHead } = job.variables;
@@ -241,25 +283,30 @@ export function makeHandler(deps: {
     // the single writer of the review-wait park (#786) — persist-round no longer sets
     // `waiting_review`, so the row rests on its running `converging` status until exactly one write
     // here resolves it, and the poller never sees a transient `waiting_review` for a husk-retry round.
+    // PROCESS-INSTANCE FENCE (Copilot #789). A straggler progress-check from a SUPERSEDED
+    // convergence instance can slip past the replay guard (its idempotency stamp was cleared when
+    // `submitPr` re-opened the PR) and reach here AFTER `submitPr` has reset the per-run fields and
+    // started a NEW convergence instance. Its stale baseline / status / watermark / result must not
+    // clobber the fresh run (which could be parked on `waiting_review` or replay stale output) — nor
+    // may it mutate GitHub with the old run's checkpoint (see the self-heal fence below).
+    // Re-read the row's CURRENT owner and report whether this job's own `processInstanceKey` no
+    // longer owns the row — the straggler's token lives in a terminated instance. Fail open (not
+    // superseded) when either key is absent (an older instance, or a row whose `process_key` is not
+    // yet seeded) so normal single-run behaviour is untouched. Compare as strings — `process_key` is
+    // persisted via `String(processInstanceKey)`, and a job key can arrive numeric.
+    const isSuperseded = async (): Promise<boolean> => {
+      const currentOwner = (await prs.get(prKey))?.process_key ?? null;
+      const jobOwner = job.processInstanceKey ?? null;
+      return currentOwner !== null && jobOwner !== null && String(currentOwner) !== String(jobOwner);
+    };
     const commit = async (
       out: Out,
       opts: { head?: string | null; status?: "waiting_review" | "converging"; agentWatermark?: string | null },
     ): Promise<Out> => {
       const ts = new Date().toISOString();
-      // PROCESS-INSTANCE FENCE (Copilot #789). A straggler progress-check from a SUPERSEDED
-      // convergence instance can slip past the replay guard (its idempotency stamp was cleared when
-      // `submitPr` re-opened the PR) and reach here AFTER `submitPr` has reset the per-run fields and
-      // started a NEW convergence instance. Its stale baseline / status / watermark / result must not
-      // clobber the fresh run (which could be parked on `waiting_review` or replay stale output).
-      // Re-read the row's CURRENT owner immediately before the write and drop the write when this
-      // job's own `processInstanceKey` no longer owns the row — the straggler's token lives in a
-      // terminated instance, so acking without persisting is correct. Fail open when either key is
-      // absent (an older instance, or a row whose `process_key` is not yet seeded) so normal
-      // single-run behaviour is untouched. Compare as strings — `process_key` is persisted via
-      // `String(processInstanceKey)`, and a job key can arrive numeric.
-      const currentOwner = (await prs.get(prKey))?.process_key ?? null;
-      const jobOwner = job.processInstanceKey ?? null;
-      if (currentOwner && jobOwner && String(currentOwner) !== String(jobOwner)) {
+      // Re-check ownership immediately before the write and drop it when this job no longer owns the
+      // row — acking without persisting is correct (the straggler's token is in a terminated instance).
+      if (await isSuperseded()) {
         return out;
       }
       await prs.update(prKey, {
@@ -386,9 +433,61 @@ export function makeHandler(deps: {
       // once the husk retry has been ruled out, so a husk-retry round never transits `waiting_review`.
       return commit(out, { head: currentHead, status: "waiting_review", agentWatermark });
     }
-    // The remaining outcome (progressed:false, huskRetry:false) escalates to a human; the
-    // persist-escalation-noprogress worker owns the status, so leave it unset — but still advance the
-    // baseline and stamp the idempotency record so a redelivered escalation replays instead of
+
+    // NO-ADVANCE SELF-HEAL (#818, Layer 2). Before escalating to a human, reconcile the round's work
+    // against the remote: a producer harness that provisioned the review shape wrong pushed the fix
+    // to a throwaway fallback branch, so it IS reachable on the remote (recorded as a durable
+    // push-checkpoint via the harness's `worldMarker`) but left the PR head un-advanced. If that
+    // checkpoint SHA STRICTLY fast-forward-descends the current head, advance the head onto it and
+    // continue the loop as real progress instead of parking a human — auto-recovering the exact
+    // divergence that stranded nanobpm/nano-coder#26/#28. `currentHead` is non-null here (a null head
+    // fails OPEN upstream via decideProgress and never reaches this escalation). Every non-heal
+    // outcome (no checkpoint, not a fast-forward, a fork head, an unreadable/refused move) degrades
+    // to escalation exactly as before — the self-heal is purely additive.
+    if (currentHead) {
+      // FENCE THE REF MUTATION (Copilot review on #818 / #819). The self-heal PATCHes the PR head on
+      // GitHub — an irreversible side effect the atomic `commit` fence below can only guard for the
+      // DB write, NOT for a mutation already made. A straggler from a SUPERSEDED instance (its stale
+      // checkpoint would resurrect old work on a PR `submitPr` has since reopened under a new
+      // `process_key`) must not move the head. Two layers guard this: (1) the run-scoped checkpoint
+      // lookup — the self-heal reads `lastCheckpointForRun(prKey, jobProcessKey, roundNo)`, so a fresh
+      // run never even sees the prior run's checkpoint; and (2) a cheap early-out here PLUS a LATE
+      // ownership re-check threaded INTO the heal (`isSuperseded` inverted → `stillOwns`), evaluated
+      // immediately before the ref PATCH, closing the check-to-mutation TOCTOU where a concurrent
+      // `submitPr` supersedes this run DURING the heal's awaits. A skipped/abandoned heal falls
+      // through to the escalation `commit`, which the same fence turns into a harmless ack-without-write.
+      const jobProcessKey = job.processInstanceKey != null ? String(job.processInstanceKey) : null;
+      if (!(await isSuperseded())) {
+        const heal = await (deps.selfHeal ?? defaultSelfHeal)(
+          app,
+          ghRepo,
+          ghNumber,
+          prKey,
+          currentHead,
+          roundNo,
+          jobProcessKey,
+          async () => !(await isSuperseded()),
+        ).catch((): SelfHealResult => ({ healed: false }));
+        if (heal.healed && heal.sha) {
+          app.log.info("no-advance self-heal advanced PR head to a reachable push-checkpoint", {
+            prKey,
+            round: roundNo,
+            from: currentHead,
+            to: heal.sha,
+          });
+          // Advance the baseline to the newly-pushed head and park at wait-review as genuine progress
+          // (husk counter reset), so the poller solicits the next Copilot review against the healed head.
+          return commit(
+            { progressed: true, huskRetries: 0 },
+            { head: heal.sha, status: "waiting_review", agentWatermark },
+          );
+        }
+      }
+    }
+
+    // The remaining outcome (progressed:false, huskRetry:false, no self-heal) escalates to a human;
+    // the persist-escalation-noprogress worker owns the status, so leave it unset — but still advance
+    // the baseline and stamp the idempotency record so a redelivered escalation replays instead of
     // recomputing.
     return commit(out, { head: currentHead, agentWatermark });
   };

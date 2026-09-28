@@ -185,6 +185,7 @@ function fakeApp(
     // exercises the AVAILABILITY-AWARE default reader unless it injects its own readAgentWork or a
     // non-empty instance list.
     engine: { searchAgentInstances },
+    log: { info() {}, warn() {}, error() {}, debug() {} },
     data: {
       table(_name: string, _key: string) {
         return {
@@ -211,9 +212,23 @@ async function makeUnderTest(
     round: number,
     priorWatermark?: string | null,
   ) => Promise<boolean | null | { work: boolean | null; consumedKey?: string | null }>,
+  selfHeal?: (
+    app: unknown,
+    repo: string,
+    prNumber: number,
+    prKey: string,
+    currentHead: string,
+    roundNo: number,
+    processKey: string | null,
+    stillOwns: () => Promise<boolean>,
+  ) => Promise<{ healed: boolean; sha?: string; reason?: string }>,
 ) {
   const { makeHandler } = await import("../workers/progress-check/worker.ts");
-  return makeHandler(readAgentWork ? { readHead, readAgentWork } : { readHead });
+  // Default the self-heal OFF (always `{ healed: false }`) so the existing escalation tests keep
+  // escalating without touching the real WorldStore/GitHub deps; the #818 tests inject a healing stub.
+  const heal = selfHeal ?? (async () => ({ healed: false }));
+  // biome-ignore lint/suspicious/noExplicitAny: test double for the injectable worker deps.
+  return makeHandler({ readHead, ...(readAgentWork ? { readAgentWork } : {}), selfHeal: heal as any });
 }
 
 test("progress-check: a non-addressed round records the baseline and consumes the attempt watermark but never escalates", async () => {
@@ -310,6 +325,98 @@ test("progress-check: an unchanged head with a terminal agent-instance escalates
   assertEquals(out.huskRetry, false, "a corroborated no-advance round is never auto-retried");
   assertEquals(out.noProgressReason, "no-advance");
   assertStringIncludes(String(out.noProgressQuestion), "PR head did not advance");
+});
+
+test("progress-check: a no-advance round self-heals to a reachable push-checkpoint and continues instead of escalating (#818)", async () => {
+  // The head did NOT advance and the agent-instance corroborates a real no-advance (terminal
+  // instance) — normally an immediate escalation. But a recorded push-checkpoint fast-forward-
+  // descends the head (a producer harness pushed the fix to a fallback branch, off the PR head), so
+  // the self-heal advances the head onto it and the loop continues as real progress.
+  let healArgs: unknown[] = [];
+  let healStillOwns: (() => Promise<boolean>) | null = null;
+  const handler = await makeUnderTest(
+    async () => "sha-1",
+    async () => true,
+    async (_app, repo, prNumber, prKey, currentHead, roundNo, processKey, stillOwns) => {
+      healArgs = [repo, prNumber, prKey, currentHead, roundNo, processKey];
+      healStillOwns = stillOwns;
+      return { healed: true, sha: "healed-sha" };
+    },
+  );
+  const { app, updates } = fakeApp({ last_round_head: "sha-1", process_key: "pik" });
+  const out = await handler(
+    { processInstanceKey: "pik", variables: { prKey: "o/r#1", status: "addressed", repo: "o/r", prNumber: 1, round: 3, huskRetries: 0 } } as any,
+    app as any,
+  );
+  assertEquals(out, { progressed: true, huskRetries: 0 }, "a healed round continues as real progress");
+  assertEquals(
+    healArgs,
+    ["o/r", 1, "o/r#1", "sha-1", 3, "pik"],
+    "self-heal is called with the repo/number/prKey, the current head as compare base, the round, and THIS run's process key (#819)",
+  );
+  assertEquals(typeof healStillOwns, "function", "a late ownership guard is threaded into the heal (#819)");
+  assertEquals(await (healStillOwns as unknown as () => Promise<boolean>)(), true, "the owning run's guard reports ownership");
+  // The healed head becomes the new baseline and the round parks at wait-review (one atomic write).
+  assertEquals(updates.length, 1, "the healed head is rebaselined and parked in one atomic write");
+  assertEquals(updates[0]!.patch.last_round_head, "healed-sha", "the baseline advances to the healed head");
+  assertEquals(updates[0]!.patch.status, "waiting_review", "a healed round parks for the next review");
+});
+
+test("progress-check: self-heal is NOT attempted on a progressed round (only before an escalation)", async () => {
+  let healCalls = 0;
+  const handler = await makeUnderTest(
+    async () => "sha-2", // head advanced → progressed, no escalation
+    undefined,
+    async () => (healCalls++, { healed: true, sha: "x" }),
+  );
+  const { app } = fakeApp({ last_round_head: "sha-1" });
+  const out = await handler(
+    { processInstanceKey: "pik", variables: { prKey: "o/r#1", status: "addressed", repo: "o/r", prNumber: 1, round: 2 } } as any,
+    app as any,
+  );
+  assertEquals(out.progressed, true);
+  assertEquals(healCalls, 0, "a genuinely-progressing round never consults the self-heal");
+});
+
+test("progress-check: a no-advance round with no recoverable checkpoint still escalates (#818)", async () => {
+  // The self-heal declines (no reachable fast-forward checkpoint) → the round escalates exactly as
+  // before the self-heal existed.
+  const handler = await makeUnderTest(
+    async () => "sha-1",
+    async () => true,
+    async () => ({ healed: false, reason: "no-checkpoint" }),
+  );
+  const { app } = fakeApp({ last_round_head: "sha-1" });
+  const out = await handler(
+    { processInstanceKey: "pik", variables: { prKey: "o/r#1", status: "addressed", repo: "o/r", prNumber: 1, round: 3, huskRetries: 0 } } as any,
+    app as any,
+  );
+  assertEquals(out.progressed, false, "an unrecoverable no-advance still escalates");
+  assertEquals(out.noProgressReason, "no-advance");
+  assertStringIncludes(String(out.noProgressQuestion), "PR head did not advance");
+});
+
+test("progress-check: a SUPERSEDED straggler never invokes the self-heal — no stale ref mutation on a reopened PR (#818 fence)", async () => {
+  // A delayed progress-check from an OLD convergence instance can reach the no-advance branch after
+  // `submitPr` reopened the PR under a NEW `process_key`. The commit fence already drops its DB write,
+  // but the self-heal PATCHes the GitHub head — an irreversible side effect. So the worker must
+  // re-check ownership BEFORE the ref mutation and skip the heal entirely when superseded, else a
+  // straggler's stale checkpoint resurrects old work on the reopened PR.
+  let healCalls = 0;
+  const handler = await makeUnderTest(
+    async () => "sha-1",
+    async () => true,
+    async () => (healCalls++, { healed: true, sha: "stale-sha" }),
+  );
+  // The row is owned by a DIFFERENT (newer) instance than this straggler job's processInstanceKey.
+  const { app, updates } = fakeApp({ last_round_head: "sha-1", process_key: "new-pik" });
+  const out = await handler(
+    { processInstanceKey: "old-pik", variables: { prKey: "o/r#1", status: "addressed", repo: "o/r", prNumber: 1, round: 3, huskRetries: 0 } } as any,
+    app as any,
+  );
+  assertEquals(healCalls, 0, "a superseded straggler must NOT mutate the GitHub head via self-heal");
+  assertEquals(updates.length, 0, "and the commit fence drops its DB write too (ack without persisting)");
+  assertEquals(out.progressed, false, "the straggler still returns its escalation verdict to ack the job");
 });
 
 test("progress-check: an addressed round whose head advanced reports progressed:true and rebaselines", async () => {
