@@ -1,3 +1,9 @@
+## [0.193.1](https://github.com/nanobpm/nano-workforce/compare/v0.193.0...v0.193.1) (2026-09-28)
+
+### Bug Fixes
+
+* **convergence:** reset round output vars on entry so a no-result round can't re-escalate ([#823](https://github.com/nanobpm/nano-workforce/issues/823)) ([3154918](https://github.com/nanobpm/nano-workforce/commit/3154918f3aeea477733347277ec067c1e0359e84)), closes [nano-coder#35](https://github.com/nanobpm/nano-coder/issues/35) [#806](https://github.com/nanobpm/nano-workforce/issues/806) [#822](https://github.com/nanobpm/nano-workforce/issues/822) [#822](https://github.com/nanobpm/nano-workforce/issues/822)
+
 ## [0.193.0](https://github.com/nanobpm/nano-workforce/compare/v0.192.0...v0.193.0) (2026-09-28)
 
 ### Features
