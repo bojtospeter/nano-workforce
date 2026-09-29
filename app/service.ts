@@ -611,6 +611,20 @@ async function submitPrCritical(
   // RESUBMITTABLE — fall through and re-enroll, exactly as `startFeature`'s intake guard (feature.ts)
   // treats a keyless `running` feature row. A terminal row (any `process_key`) already falls through.
   if (trackedExisting && existing?.process_key != null && !TERMINAL_STATUSES.includes(trackedExisting.derived_status)) {
+    // Human approval is monotonic (issue #826): a gated caller adopting a live loop — possibly an
+    // ungated one another run started — narrows it to gated instead of inheriting its auto-merge.
+    // Idempotent, so a retry against our own gated loop is a no-op. A loop the engine reports gone
+    // (absent or terminal) has already handed off to the merge stage and can no longer be gated.
+    if (humanApproval && !convergeOnly) {
+      const loopKey = existing.process_key;
+      const match = (await engine.searchProcessInstances({ processInstanceKeys: [loopKey] })).find(
+        (s) => String(s.processInstanceKey) === loopKey,
+      );
+      const state = match ? String(match.state ?? "").trim().toUpperCase() : null;
+      if (state !== null && !ENGINE_TERMINAL_STATES.has(state)) {
+        await engine.setVariables({ scopeKey: loopKey, variables: { humanApproval: true } });
+      }
+    }
     return { prKey: parsed.prKey, alreadyRunning: true };
   }
 

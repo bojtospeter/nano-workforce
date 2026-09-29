@@ -18,8 +18,9 @@ after(async () => {
   await Promise.all(engines.map((e) => e.close()));
 });
 
-/** Boots one loop whose every round converges cleanly; `answers` records the `answer` each review round saw. */
-async function boot(vars: Record<string, unknown>) {
+/** Boots one loop whose every round converges cleanly; `answers` records the `answer` each review round saw.
+ *  Job types in `held` get no worker until `register(type)`, so a test can act while the loop waits there. */
+async function boot(vars: Record<string, unknown>, held: string[] = []) {
   const engine = await createWasmEngineClient();
   engines.push(engine);
   await engine.deployResources([{ name: "convergence-loop.bpmn", content: MODEL, contentType: "text/xml" }]);
@@ -36,15 +37,15 @@ async function boot(vars: Record<string, unknown>) {
     "senior:scope-classify": () => ({ scopeBlocked: false, scopeBlockReason: "" }),
     "pr.finalize": () => ({}),
   };
-  for (const [type, work] of Object.entries(workers)) {
-    await engine.registerWorker(type, (job) => work((job as { variables: Record<string, unknown> }).variables));
-  }
-  await engine.createInstance({
+  const register = (type: string) =>
+    engine.registerWorker(type, (job) => workers[type]((job as { variables: Record<string, unknown> }).variables));
+  for (const type of Object.keys(workers)) if (!held.includes(type)) await register(type);
+  const { processInstanceKey } = await engine.createInstance({
     processDefinitionId: "convergence-loop",
     awaitCompletion: false,
     variables: { prKey: "o/r#1", repo: "o/r", prNumber: 1, round: 1, maxRounds: 20, answer: null, huskRetries: 0, ...vars },
   });
-  return { engine, answers };
+  return { engine, answers, register, processInstanceKey };
 }
 
 function completions(engine: WasmEngineClient, elementId: string): number {
@@ -91,6 +92,16 @@ test("request changes sends the guidance to the review agent on the same PR, the
   assertEquals(completions(engine, "persist-converged"), 0);
   const second = await openApproval(engine);
   assert(second !== undefined && second !== first, "approval is asked again after the revision");
+});
+
+test("a live ungated loop narrowed to humanApproval (a gated submitPr adopting it) parks for approval", async () => {
+  // `submitPr` narrows an adopted live loop with setVariables (app/service.ts); the gateway must honour it.
+  const { engine, register, processInstanceKey } = await boot({ humanApproval: false }, ["senior:pr-review"]);
+  loop(engine).isActive().hasActiveElement("review-round");
+  await engine.setVariables({ scopeKey: String(processInstanceKey), variables: { humanApproval: true } });
+  await register("senior:pr-review");
+  loop(engine).isActive().hasActiveElement(PR_MERGE_APPROVAL_ELEMENT).hasNoIncident();
+  assertEquals(completions(engine, "persist-converged"), 0, "the adopted loop never merges unapproved");
 });
 
 test("fail-closed: a completion without an explicit approve never merges", async () => {

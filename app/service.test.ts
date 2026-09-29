@@ -891,6 +891,56 @@ test("submitPr seeds humanApproval (issue #826), pinned off for a converge-only 
   });
 });
 
+// Adoption (issue #826, Copilot review): `submitPr` returns `alreadyRunning` for a PR whose loop is
+// live, so a gated caller adopting an UNGATED loop would inherit its auto-merge. `humanApproval` is
+// monotonic: the gated caller narrows the live loop (idempotent, so a retry against its own gated loop
+// is a no-op). A loop already past convergence (merge stage, instance COMPLETED) can't be re-gated.
+function adoptLoop(status: string, loopState: string) {
+  const stores: Record<string, { rows: unknown[]; key: string }> = {
+    pull_requests: {
+      rows: [{ pr_key: "owner/repo#14", repo: "owner/repo", number: 14, url: "https://github.com/owner/repo/pull/14", title: "t", status, current_round: 1, process_key: "PI-LOOP" }],
+      key: "pr_key",
+    },
+    escalations: { rows: [], key: "id" },
+    pr_dependencies: { rows: [], key: "pr_key" },
+  };
+  const data = {
+    table: withTrackingViews((name: string, key: string) => memTable(stores[name]?.rows ?? [], stores[name]?.key ?? key)),
+    open: () => memOpen(stores),
+  } as any;
+  const narrowed: unknown[] = [];
+  const engine = {
+    createInstance: () => Promise.reject(new Error("a live PR is adopted, never re-created")),
+    searchProcessInstances: () => Promise.resolve([{ processInstanceKey: "PI-LOOP", state: loopState }]),
+    setVariables: (req: unknown) => {
+      narrowed.push(req);
+      return Promise.resolve();
+    },
+  } as any;
+  return { data, engine, narrowed };
+}
+
+test("a gated submitPr adopting a live loop narrows it to humanApproval (issue #826)", async () => {
+  await withGithubOff(async () => {
+    const pr = { repo: "owner/repo", number: 14, url: "https://github.com/owner/repo/pull/14", prKey: "owner/repo#14" };
+    const live = adoptLoop("converging", "ACTIVE");
+    assertEquals(await submitPr(live.data, live.engine, pr, [], 20, false, null, true), { prKey: pr.prKey, alreadyRunning: true });
+    assertEquals(live.narrowed, [{ scopeKey: "PI-LOOP", variables: { humanApproval: true } }]);
+
+    const ungated = adoptLoop("converging", "ACTIVE");
+    await submitPr(ungated.data, ungated.engine, pr);
+    assertEquals(ungated.narrowed, [], "an ungated adopter leaves the loop's mode alone");
+
+    const convergeOnly = adoptLoop("converging", "ACTIVE");
+    await submitPr(convergeOnly.data, convergeOnly.engine, pr, [], 20, true, null, true);
+    assertEquals(convergeOnly.narrowed, [], "a converge-only adopter never merges, so never gates");
+
+    const merging = adoptLoop("waiting_deps", "COMPLETED");
+    assertEquals(await submitPr(merging.data, merging.engine, pr, [], 20, false, null, true), { prKey: pr.prKey, alreadyRunning: true });
+    assertEquals(merging.narrowed, [], "a loop already past convergence is not touched");
+  });
+});
+
 // Lineage threading (issue #245): `submitPr` persists the origin `root_request_key` on the PR row
 // and carries it onto the convergence instance; `startMerge` reads it back off the row onto the
 // merge instance. A human/webhook submit that supplies no root self-roots on the `pr_key` (its own

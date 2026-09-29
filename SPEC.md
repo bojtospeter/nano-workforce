@@ -163,7 +163,10 @@ native `merge-approval` user task (`merge-approval.form`, surfaced in the Tasks 
 continues to `pr.finalize`, which hands the PR to the merge-loop. Anything else (the form's
 `revise` plus required guidance) loops back to `capture-head` with the guidance as `answer`, so
 the review agent updates the **same** PR. Convergence then re-runs and approval is asked again.
-The default route is fail-closed: nothing merges without an explicit approval. The task is
+The default route is fail-closed: once parked, nothing merges without an explicit approval. A
+gated run that adopts a PR already converging under a live loop (e.g. one an ungated run started)
+narrows that loop to `humanApproval = true` rather than inheriting its auto-merge; a PR already
+past convergence (handed to the merge-loop) can no longer be gated. The task is
 human-only (never agent-answerable) and never auto-resumed from an adjudication. Without the
 flag the gateway defaults straight through, so existing runs are unchanged.
 
