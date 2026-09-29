@@ -1,3 +1,9 @@
+## [0.193.2](https://github.com/nanobpm/nano-workforce/compare/v0.193.1...v0.193.2) (2026-09-29)
+
+### Bug Fixes
+
+* **convergence:** heal PR rows stuck at status=escalated after escalation answered ([#829](https://github.com/nanobpm/nano-workforce/issues/829)) ([235a004](https://github.com/nanobpm/nano-workforce/commit/235a004f73ec1b27f52b5dfe88e2f2a28c1d99e8)), closes [#642](https://github.com/nanobpm/nano-workforce/issues/642) [#828](https://github.com/nanobpm/nano-workforce/issues/828) [#828](https://github.com/nanobpm/nano-workforce/issues/828) [#828](https://github.com/nanobpm/nano-workforce/issues/828) [#828](https://github.com/nanobpm/nano-workforce/issues/828)
+
 ## [0.193.1](https://github.com/nanobpm/nano-workforce/compare/v0.193.0...v0.193.1) (2026-09-28)
 
 ### Bug Fixes
