@@ -114,7 +114,7 @@ export const MCP_TOOL_COUNT_BUDGET = 60;
  *
  * RAISE PROVENANCE — 87_000 → 87_500 (#826): the per-run `humanApproval` start option on both
  * `startFeature` body variants (`FeatureStartByIssue`/`FeatureStartByUrl`) — the Feature tab's
- * "Human approval before merge" checkbox. Measured 87,273 bytes serialized (86,862 → 87,273 — over
+ * "Human approval before merge" checkbox. Measured 87,293 bytes serialized (86,862 → 87,293 — over
  * the old ceiling's 138-byte headroom). Deliberate, documented growth — not schema fat.
  */
 export const MCP_SURFACE_BYTES_BUDGET = 87_500;

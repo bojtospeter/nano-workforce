@@ -58,12 +58,6 @@ export const PR_WAIT_MERGE_ANSWER_ELEMENT = "wait-merge-answer";
  *  approve a merge. */
 export const PR_MERGE_APPROVAL_ELEMENT = "merge-approval";
 
-/** The Tasks-inbox "Decision context" for {@link PR_MERGE_APPROVAL_ELEMENT} — static, because the
- *  subject (the PR title + link) already identifies what is being approved. */
-export const MERGE_APPROVAL_QUESTION =
-  "This PR converged. Approve merging it, or request changes: your guidance goes to the review agent, " +
-  "which updates this same PR; convergence then re-runs and approval is asked again.";
-
 /** The PR review-loop answer-recording service task (convergence-loop.bpmn) — the `pr.answer-escalation`
  *  job the token moves to IMMEDIATELY when `wait-answer` completes. Its ACTIVE element instance is the
  *  positive-evidence marker that an operator's answer is in-flight (recorded but the loop hasn't looped

@@ -61,7 +61,7 @@ export interface FeatureRun {
   converge: number;
   auto_merge: number;
   /** 1 ⇒ a human must approve the converged PR before the merge-loop runs (issue #826). Only
-   * meaningful with `auto_merge = 1`; pinned to 0 otherwise. */
+   * meaningful with `auto_merge = 1`; the `startFeature` operation pins it to 0 otherwise. */
   human_approval: number;
   outcome: string | null;
   /** Human rollup detail. Projected by `pollFeatureDelivery` (fix: Feature history stuck at

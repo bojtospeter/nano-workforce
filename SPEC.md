@@ -156,7 +156,8 @@ loop feeds and reads this memory — a merge-loop answer (same `pr.answer-escala
 is tagged `answerContext = "merge"` and never recorded as a convergence adjudication.
 
 **Human approval before merge (issue #826).** A feature run started with `humanApproval`
-(only meaningful with `autoMerge`) seeds `humanApproval = true` on its convergence instance.
+seeds `humanApproval = true` on its convergence instance — only when the PR would merge
+(`autoMerge` on and `NANO_PR_AUTO_MERGE` enabled; otherwise it is pinned off).
 After the scope gate passes, the `human approval?` gateway then parks the converged PR on the
 native `merge-approval` user task (`merge-approval.form`, surfaced in the Tasks inbox as
 "PR merge approval") instead of going straight to `[Mark converged]`. `mergeDecision = "approve"`
@@ -165,8 +166,8 @@ continues to `pr.finalize`, which hands the PR to the merge-loop. Anything else 
 the review agent updates the **same** PR. Convergence then re-runs and approval is asked again.
 The default route is fail-closed: once parked, nothing merges without an explicit approval. A
 gated run that adopts a PR already converging under a live loop (e.g. one an ungated run started)
-narrows that loop to `humanApproval = true` rather than inheriting its auto-merge; a PR already
-past convergence (handed to the merge-loop) can no longer be gated. The task is
+narrows that loop to `humanApproval = true` rather than inheriting its auto-merge; a loop already
+past its `human approval?` gateway can no longer be gated. The task is
 human-only (never agent-answerable) and never auto-resumed from an adjudication. Without the
 flag the gateway defaults straight through, so existing runs are unchanged.
 

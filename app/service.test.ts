@@ -941,6 +941,29 @@ test("a gated submitPr adopting a live loop narrows it to humanApproval (issue #
   });
 });
 
+test("human approval is pinned off when NANO_PR_AUTO_MERGE is off — the PR never merges (issue #826)", async () => {
+  // `AUTO_MERGE` is read once at import, so load a fresh copy of the module under the env.
+  const prev = process.env["NANO_PR_AUTO_MERGE"];
+  process.env["NANO_PR_AUTO_MERGE"] = "0";
+  try {
+    const mod: typeof import("./service.ts") = await import(`./service.ts?autoMergeOff=${Date.now()}`);
+    await withGithubOff(async () => {
+      const fresh = captureVars();
+      const pr15 = { repo: "owner/repo", number: 15, url: "https://github.com/owner/repo/pull/15", prKey: "owner/repo#15" };
+      await mod.submitPr(fresh.data, fresh.engine, pr15, [], 20, false, null, true);
+      assertEquals(fresh.get()?.humanApproval, false, "no approval task for a merge that never happens");
+
+      const live = adoptLoop("converging", "ACTIVE");
+      const pr14 = { repo: "owner/repo", number: 14, url: "https://github.com/owner/repo/pull/14", prKey: "owner/repo#14" };
+      await mod.submitPr(live.data, live.engine, pr14, [], 20, false, null, true);
+      assertEquals(live.narrowed, [], "nor is an adopted loop narrowed");
+    });
+  } finally {
+    if (prev === undefined) delete process.env["NANO_PR_AUTO_MERGE"];
+    else process.env["NANO_PR_AUTO_MERGE"] = prev;
+  }
+});
+
 // Lineage threading (issue #245): `submitPr` persists the origin `root_request_key` on the PR row
 // and carries it onto the convergence instance; `startMerge` reads it back off the row onto the
 // merge instance. A human/webhook submit that supplies no root self-roots on the `pr_key` (its own

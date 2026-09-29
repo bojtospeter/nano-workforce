@@ -104,7 +104,6 @@ import {
   latestOpenEscalationQuestion,
   latestPlanReviewFindings,
   latestTrialMergeQuestion,
-  MERGE_APPROVAL_QUESTION,
   type OpenEscalation,
   PLAN_REVIEW_ELEMENT,
   PR_ESCALATION_PRODUCER_ELEMENTS,
@@ -592,6 +591,10 @@ async function submitPrCritical(
   rootRequestKey: string | null = null,
   humanApproval = false,
 ) {
+  // Human approval before merge (issue #826) gates only a PR that `pr.finalize` would hand to the
+  // merge-loop — its own predicate, `AUTO_MERGE && convergeOnly !== true`. A run that won't merge
+  // (review-only, or the global switch off) must not park for a pointless approval.
+  const gated = humanApproval && !convergeOnly && AUTO_MERGE;
   const table = prs(data);
   const existing = await table.get(parsed.prKey);
   // ADR-0065: classify "already running" on the DERIVED terminal edge, not the base transient. A
@@ -613,9 +616,9 @@ async function submitPrCritical(
   if (trackedExisting && existing?.process_key != null && !TERMINAL_STATUSES.includes(trackedExisting.derived_status)) {
     // Human approval is monotonic (issue #826): a gated caller adopting a live loop — possibly an
     // ungated one another run started — narrows it to gated instead of inheriting its auto-merge.
-    // Idempotent, so a retry against our own gated loop is a no-op. A loop the engine reports gone
-    // (absent or terminal) has already handed off to the merge stage and can no longer be gated.
-    if (humanApproval && !convergeOnly) {
+    // Idempotent, so a retry against our own gated loop is a no-op. A loop the engine no longer reports
+    // running is left alone; one already past its `human approval?` gateway can no longer be gated.
+    if (gated) {
       const loopKey = existing.process_key;
       const match = (await engine.searchProcessInstances({ processInstanceKeys: [loopKey] })).find(
         (s) => String(s.processInstanceKey) === loopKey,
@@ -743,8 +746,8 @@ async function submitPrCritical(
       // NANO_PR_AUTO_MERGE default. Only ever narrows (never forces merge on when auto-merge is off).
       convergeOnly,
       // Human approval before merge (issue #826): a converged PR parks at the `merge-approval` user
-      // task before `pr.finalize` hands it to the merge-loop. Moot for a converge-only run (no merge).
-      humanApproval: humanApproval && !convergeOnly,
+      // task before `pr.finalize` hands it to the merge-loop. Pinned off when the PR won't merge.
+      humanApproval: gated,
       // Cooperative abandon check (#76): the capability URL + the abort brief appended to the
       // review-round agent's prompt, so it can stop before pushing if the run is cancelled.
       abandonUrl: abUrl,
@@ -3141,9 +3144,6 @@ export async function pollUserTasks(
       case PR_WAIT_ANSWER_ELEMENT:
       case PR_WAIT_MERGE_ANSWER_ELEMENT:
         question = latestOpenEscalationQuestion(await prEscalations(data).find({ pr_key: subjectKey, status: "open" }));
-        break;
-      case PR_MERGE_APPROVAL_ELEMENT:
-        question = MERGE_APPROVAL_QUESTION;
         break;
       case CONFORMANCE_ESCALATION_ELEMENT:
         question = conformanceEscalationQuestion(subj ? { summary: subj.conformanceSummary } : undefined);
