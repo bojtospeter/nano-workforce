@@ -618,8 +618,9 @@ async function submitPrCritical(
     // ungated one another run started — narrows it to gated instead of inheriting its auto-merge.
     // Idempotent, so a retry against our own gated loop is a no-op. A loop the engine no longer reports
     // running is left alone; one already past its `human approval?` gateway can no longer be gated. A
-    // finalized PR (`converged_at` set) is past it: `startMerge` re-pointed its `process_key` at the
-    // merge-loop, which must not be written to.
+    // finalized PR (`converged_at` set) is past it, and `startMerge` has re-pointed its `process_key` at
+    // the merge-loop, so it is skipped. Mid-handoff (key re-pointed, `converged_at` not yet stamped) the
+    // write reaches the merge-loop but is inert: nothing there reads `humanApproval`.
     if (gated && existing.converged_at == null) {
       const loopKey = existing.process_key;
       const match = (await engine.searchProcessInstances({ processInstanceKeys: [loopKey] })).find(

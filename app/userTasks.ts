@@ -54,8 +54,8 @@ export const PR_WAIT_MERGE_ANSWER_ELEMENT = "wait-merge-answer";
 
 /** The optional human merge-approval user task (convergence-loop.bpmn, issue #826) — a converged PR
  *  parks here before `pr.finalize` hands it to the merge-loop. Approve merges; request changes loops
- *  the guidance (`answer`) back to the review agent on the same PR. Human-only: an agent must never
- *  approve a merge. */
+ *  the guidance (`answer`) back to the review agent on the same PR. HUMAN-only: never agent-answerable,
+ *  so the fleet can never auto-approve a merge. */
 export const PR_MERGE_APPROVAL_ELEMENT = "merge-approval";
 
 /** The PR review-loop answer-recording service task (convergence-loop.bpmn) — the `pr.answer-escalation`

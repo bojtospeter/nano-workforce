@@ -136,7 +136,8 @@ export const HUMAN_COMPLETABLE_ELEMENTS: ReadonlySet<string> = new Set([
   READINESS_ESCALATION_PF_TASK_ELEMENT,
   READINESS_ESCALATION_TASK_ELEMENT,
   ACP_PERMISSION_ELEMENT,
-  // Human-only (issue #826): an agent must never approve a merge, so it stays OUT of ESCALATION_TASK_ELEMENTS.
+  // Human-only (issue #826): never agent-answerable, so it stays OUT of ESCALATION_TASK_ELEMENTS and the
+  // fleet can never auto-approve a merge.
   PR_MERGE_APPROVAL_ELEMENT,
 ]);
 
