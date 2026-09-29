@@ -106,6 +106,9 @@ import {
   latestTrialMergeQuestion,
   type OpenEscalation,
   PLAN_REVIEW_ELEMENT,
+  PR_ESCALATION_PRODUCER_ELEMENTS,
+  PR_RECORD_ANSWER_ELEMENT,
+  PR_RECORD_MERGE_ANSWER_ELEMENT,
   PR_WAIT_ANSWER_ELEMENT,
   PR_WAIT_MERGE_ANSWER_ELEMENT,
   prEscalations,
@@ -250,6 +253,15 @@ export const REVIEW_NUDGE_MS = clampNudgeMinutes(process.env.NANO_PR_REVIEW_NUDG
  * window, by when the user task must already be observable — sparing the in-flight transition while
  * still reconciling genuinely-stranded rows. */
 export const FEATURE_ESCALATION_HEAL_GRACE_MS = 60_000;
+
+/** Grace window (ms) before the `escalated`→`converging` PR self-heal (below) may act on a row — the
+ * convergence-path twin of `FEATURE_ESCALATION_HEAL_GRACE_MS` (issue #828). The sole writer of a PR's
+ * `status="escalated"` — `pr.persist-escalation` — stamps the row IMMEDIATELY BEFORE the engine creates
+ * the `wait-answer` / `wait-merge-answer` user task. A poll landing in that window would see
+ * `openUserTasks` report none and wrongly heal the just-raised escalation back to `converging`, hiding
+ * it before the operator can answer. Only heal rows whose escalation is older than this window, by when
+ * the user task must already be observable. */
+export const PR_ESCALATION_HEAL_GRACE_MS = 60_000;
 
 /** Whether a converged PR is automatically driven to merge (the merge-loop). Default on; set
  * `NANO_PR_AUTO_MERGE=0` to stop at `converged` (review-only mode). */
@@ -3324,6 +3336,152 @@ export async function pollUserTasks(
     }
     if (queryErrored || stillParked) continue;
     await featureRuns(data).update(run.feature_key, { status: "running", updated_at: at });
+  }
+
+  // ── Self-heal: a convergence PR row holds `escalated` ONLY while parked (issue #828) ─────────────
+  // The convergence-path twin of the feature self-heal above (issue #642). `pr.persist-escalation` is
+  // the sole writer of a PR's `status="escalated"`, and the sole writer that moves it back off is the
+  // `pr.answer-escalation` worker (the guarded `UPDATE … SET status='converging'` on user-task
+  // completion). When that write is lost — e.g. the app restarts while a `wait-answer` completion /
+  // `answer-escalation` job is in flight — the engine resumes the loop (token back on `review-round`,
+  // no open user task) but the PR row stays `escalated` forever, since NOTHING on the PR path repairs
+  // it (unlike the feature path). `/status` then shows `status="escalated"` with a null derived
+  // `openEscalation` indefinitely, inviting a human to answer an already-answered question.
+  //
+  // Heal it engine-first, on the SAME positive-evidence contract as the feature sweep: a PR at
+  // `status="escalated"` is reconciled back to `converging` only when the engine confirms NO open PR
+  // escalation task (`wait-answer` / `wait-merge-answer`) for its instance. As above, presence in THIS
+  // pass's `desired` set is itself positive evidence of parking (truncation only ever DROPS tasks), so a
+  // PR whose escalation task was already swept is genuinely parked — skip its per-instance RPC. Only a
+  // PR not confirmed parked by the sweep falls through to the per-instance `openUserTasks` check, and a
+  // query error is negative evidence (skip the heal), so durable state flips only on positive proof.
+  //
+  // Candidate set: read through the ADR-0065 derived tracking VIEW and require `derived_status="escalated"`
+  // (Copilot review of #829). A PR TERMINATED while its base status was `escalated` keeps that frozen base
+  // status forever — the reconciler never rewrites it (app/instanceTracking.ts) — so a raw `prs.find({
+  // status:"escalated" })` scan would reselect every such HISTORICAL row on every poll and burn up to three
+  // sequential engine RPCs on each, indefinitely. The VIEW folds the terminal edge to `derived_status`
+  // (out-of-band terminate → `abandoned`), so filtering on `derived_status="escalated"` bounds the pass to
+  // LIVE/UNKNOWN candidates and leaves terminal rows to tracking as intended; the ACTIVE-instance gate below
+  // is the correctness backstop for a candidate the VIEW hasn't yet reconciled. Writes still target `prs`.
+  const sweptParkedPrEscalations = new Set<string>();
+  for (const r of desired) {
+    if (r.element_id !== PR_WAIT_ANSWER_ELEMENT && r.element_id !== PR_WAIT_MERGE_ANSWER_ELEMENT) continue;
+    if (r.subject_type !== "pr") continue;
+    if (r.process_key) sweptParkedPrEscalations.add(r.process_key);
+    if (r.subject_key) sweptParkedPrEscalations.add(r.subject_key);
+  }
+  for (const pr of await prsTracking(data).find({ derived_status: "escalated" })) {
+    if (!pr.process_key) continue;
+    if (sweptParkedPrEscalations.has(pr.process_key) || sweptParkedPrEscalations.has(pr.pr_key)) continue; // parked this pass — no RPC, no heal
+    // Don't race a just-raised escalation: `pr.persist-escalation` stamps `updated_at` immediately
+    // before the engine creates the user task, so heal only rows past the grace window.
+    const escalatedAt = Date.parse(pr.updated_at ?? "");
+    if (Number.isFinite(escalatedAt) && Date.now() - escalatedAt < PR_ESCALATION_HEAL_GRACE_MS) continue;
+    // Snapshot the PR generation (`process_key` + `updated_at`) and the `open` escalation rows we observe
+    // NOW — BEFORE the remote engine reads below. The repair writes are fenced on this snapshot, so a
+    // FRESH escalation the SAME instance opens in the read→write window is neither clobbered nor retired.
+    // The convergence loop REUSES one process instance across rounds, so a re-escalation keeps the same
+    // `process_key`; the discriminator is `updated_at`, which `pr.persist-escalation` re-stamps every time
+    // it writes `status="escalated"`. Capturing the open-escalation ids here (not re-reading `status=open`
+    // after the write) means a fresh escalation row — a NEW id inserted after this point — is never retired
+    // to `stale` even though it is `open`, since it was not part of the snapshot we healed (issue #829).
+    const snapshotProcessKey = pr.process_key;
+    const snapshotUpdatedAt = pr.updated_at ?? null;
+    const snapshotOpenEscalationIds = (await escs(data).find({ pr_key: pr.pr_key, status: "open" })).map((e) => e.id);
+    let stillParked = false;
+    let escalationInFlight = false;
+    let instanceActive = false;
+    let queryErrored = false;
+    try {
+      const openTasks = await engine.openUserTasks({ processInstanceKey: pr.process_key });
+      stillParked = openTasks.some((t) => t.elementId === PR_WAIT_ANSWER_ELEMENT || t.elementId === PR_WAIT_MERGE_ANSWER_ELEMENT);
+      // An empty open-task set is NOT yet proof the escalation is dead. Two distinct DB/engine boundaries
+      // each leave the row `escalated` with NO open user task while an escalation is genuinely live:
+      //
+      //   1. The ANSWER side. `pr.answer-escalation` (`record-answer` / `record-merge-answer`) is the sole
+      //      writer that moves a PR OFF `escalated`, and both BPMN models flow the completed `wait-answer` /
+      //      `wait-merge-answer` user task DIRECTLY to that service task. So a normal answer has a window
+      //      where the user task is already gone (this query returns none) while the answer-recording job is
+      //      still queued or running.
+      //   2. The PRODUCER side. `pr.persist-escalation` (the `PR_ESCALATION_PRODUCER_ELEMENTS`) COMMITS the
+      //      `open` row and `status="escalated"` IMMEDIATELY BEFORE the engine creates the `wait-answer` /
+      //      `wait-merge-answer` user task. The raise-time grace window covers the normal case, but if that
+      //      producer service task stays ACTIVE past the grace (e.g. an app restart / lease delay between
+      //      the DB commit and the job completing) the row is old enough to heal yet no user task exists.
+      //   3. The PRODUCER→USER-TASK TOCTOU BETWEEN THE TWO READS. `openUserTasks` (read 1) can return empty
+      //      while a persist producer is still ACTIVE; that producer then COMPLETES and the engine creates
+      //      the `wait-answer` / `wait-merge-answer` user task BEFORE `searchElementInstances` (read 2). Read 2
+      //      then sees an ACTIVE WAIT element — not the producer. Because user-task creation does NOT re-stamp
+      //      the PR row's `updated_at` (only `pr.persist-escalation` does, before the task exists), the row is
+      //      past the grace, so neither the grace nor the producer/answer-recorder check covers it. Treat an
+      //      ACTIVE wait element as positive evidence here too, or the CAS wins and stales a live escalation.
+      //
+      // In EITHER window the escalation is arbitrarily old (past the raise-time grace), so the grace above
+      // does not cover it. Healing here flips the row to `converging` and retires the still-`open`
+      // escalation to `stale`, and the live escalation is lost — the answer-recorder finds no target and
+      // silently drops the operator's answer, or the just-raised question never surfaces (issue #829). An
+      // ACTIVE answer-recording, persist-escalation, OR wait-answer/wait-merge-answer element instance is
+      // positive evidence an escalation is in flight, so treat it exactly like an open task and skip the
+      // heal. But even a PR with NEITHER an open task NOR any ACTIVE escalation element is NOT yet
+      // heal-eligible — it must ALSO be a confirmed-ACTIVE instance (the positive-liveness gate below);
+      // a terminal/absent instance matches this negative shape too but never resumed (the #828 tear).
+      if (!stillParked) {
+        const elements = await engine.searchElementInstances({ processInstanceKey: pr.process_key });
+        escalationInFlight = elements.some(
+          (el) =>
+            el.state === "ACTIVE" &&
+            (el.elementId === PR_RECORD_ANSWER_ELEMENT ||
+              el.elementId === PR_RECORD_MERGE_ANSWER_ELEMENT ||
+              el.elementId === PR_WAIT_ANSWER_ELEMENT ||
+              el.elementId === PR_WAIT_MERGE_ANSWER_ELEMENT ||
+              (el.elementId != null && PR_ESCALATION_PRODUCER_ELEMENTS.includes(el.elementId))),
+        );
+      }
+      // "No open task and no in-flight escalation element" is necessary but NOT sufficient to heal
+      // (Copilot review of #829). A TERMINAL or ABSENT process instance — one cancelled, completed, or
+      // dropped from the read model — ALSO reports no open task and no ACTIVE escalation element, yet its
+      // loop never resumed: flipping such a frozen `escalated` row to `converging` and retiring its audit
+      // rows fabricates a live loop the engine will never advance. Terminal/absent PRs are owned by the
+      // ADR-0065 derived tracking + reconciliation (they read `abandoned`/settled on `derived_status`), so
+      // leave them be. Require POSITIVE engine-truth that the instance is `ACTIVE` before healing — the
+      // same tri-state contract as the feature-handoff probe (search ~L2562) and `makeEngineActiveProbe`
+      // (app/reconcile.ts): ONLY a confirmed `ACTIVE` state heals; a known-terminal or genuinely-absent
+      // instance is left to tracking; a missing/empty/unknown `state` (or a query error) is spared, never
+      // healed off a wire shape we misread. So a healed row is provably the #828 lost-write tear: an
+      // ACTIVE loop that resumed but whose `status="converging"` flip was lost.
+      const snapshots = await engine.searchProcessInstances({ processInstanceKeys: [pr.process_key] });
+      const match = snapshots.find((s) => String(s.processInstanceKey) === pr.process_key);
+      instanceActive = match != null && String(match.state ?? "").trim().toUpperCase() === "ACTIVE";
+    } catch (err) {
+      console.error(`[poller] escalated-pr self-heal (${pr.pr_key} @ ${pr.process_key}): ${err}`);
+      queryErrored = true;
+    }
+    if (queryErrored || stillParked || escalationInFlight || !instanceActive) continue;
+    // Repair conditionally and atomically (Copilot review of #829). The read→write window between the
+    // engine reads above and here is wide (two remote RPCs), so the PR may have re-escalated on the same
+    // instance meanwhile; a blind `update` would then overwrite that fresh `escalated` status and retire
+    // its new `open` escalation. The PR flip is therefore a SINGLE guarded UPDATE fenced on the inspected
+    // snapshot — still `escalated`, same `process_key`, same `updated_at` — an atomic compare-and-swap
+    // (SQLite serialises it against the worker's guarded writes in the other process). Only when that CAS
+    // WON (`changed === 1`) do we retire the snapshot's own orphan escalation rows, in the SAME
+    // transaction: a crash can never leave a healed PR with a dangling `open` row, nor an un-healed PR
+    // with retired rows — a rolled-back heal is simply retried by a later pass. Retiring by the captured
+    // snapshot ids (never a fresh `status=open` re-read) means a just-opened escalation is left untouched.
+    const db = data.open();
+    await db.tx(async (t) => {
+      const flipped = await t.exec(
+        `UPDATE "pull_requests" SET "status" = 'converging', "updated_at" = ? WHERE "pr_key" = ? AND "status" = 'escalated' AND "process_key" IS ? AND "updated_at" IS ?`,
+        [at, pr.pr_key, snapshotProcessKey, snapshotUpdatedAt],
+      );
+      if (flipped.changed !== 1) return; // snapshot moved (a fresh escalation re-stamped the row) — leave it for a later pass
+      // Retire the orphaned `open` escalation rows so the audit trail matches the healed PR row — the
+      // `answer-escalation` write that would have answered/retired them was the very write we lost. We
+      // mark them `stale` (not `answered`) because no operator answer was recorded for them.
+      for (const escId of snapshotOpenEscalationIds) {
+        await t.exec(`UPDATE "escalations" SET "status" = 'stale' WHERE "id" = ? AND "status" = 'open'`, [escId]);
+      }
+    });
   }
 }
 

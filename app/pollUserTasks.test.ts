@@ -15,6 +15,34 @@ function memData(seed: Record<string, any[]> = {}): { data: DataLayer; stores: R
   const stores: Record<string, any[]> = {};
   for (const [k, v] of Object.entries(seed)) stores[k] = v.map((r) => ({ ...r }));
   function tbl(name: string, pk = "id") {
+    // The ADR-0065 derived tracking VIEW (`<base>__tracking`) is modelled as a read-only projection
+    // over its base store, augmenting each row with `derived_status` (Copilot review of #829 — the PR
+    // self-heal now reads candidates through `prsTracking` and filters on `derived_status="escalated"`).
+    // Default `derived_status` to the base `status`, so a fixture that does NOT model out-of-band
+    // termination reads live (base status passes through). A test that wants a row the reconciler has
+    // already folded terminal seeds an explicit `derived_status` (e.g. `"abandoned"`) on the base row.
+    const trackingMatch = /^(.*)__tracking$/.exec(name);
+    if (trackingMatch) {
+      const base = (stores[trackingMatch[1]] ??= [] as any[]);
+      // biome-ignore lint/suspicious/noExplicitAny: see above
+      const project = (r: any) => ({ ...r, derived_status: r.derived_status ?? r.status });
+      // biome-ignore lint/suspicious/noExplicitAny: see above
+      const match = (r: any, where: any) => Object.entries(where).every(([k, v]) => r[k] === v);
+      return {
+        async all() {
+          return base.map(project);
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: see above
+        async get(id: any) {
+          const r = base.find((row) => row[pk] === id);
+          return r ? project(r) : undefined;
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: see above
+        async find(where: any = {}) {
+          return base.map(project).filter((r) => match(r, where));
+        },
+      };
+    }
     // biome-ignore lint/suspicious/noExplicitAny: see above
     const rows = (stores[name] ??= [] as any[]);
     // biome-ignore lint/suspicious/noExplicitAny: see above
@@ -48,8 +76,63 @@ function memData(seed: Record<string, any[]> = {}): { data: DataLayer; stores: R
       },
     };
   }
-  const data = { table: (n: string, pk?: string) => tbl(n, pk) } as unknown as DataLayer;
+  const data = openableData(stores, tbl);
   return { data, stores };
+}
+
+/** Wrap the in-memory `stores` as a `DataLayer` that ALSO exposes `open()` → a `DataSource` with the
+ *  `exec` (guarded UPDATE) + `tx` (snapshot/rollback) surface the escalated-PR self-heal now uses for its
+ *  conditional, atomic repair (Copilot review of #829). `exec` interprets ONLY the two guarded statements
+ *  the heal issues — the snapshot-fenced `pull_requests` CAS and the by-id `escalations` retirement —
+ *  mutating the same store objects `table()` reads, so both surfaces stay consistent within a test. The
+ *  SQL shape itself is exercised against real SQLite by the app's integration/e2e suites; here the fake
+ *  need only honour the guards so a race assertion can observe the CAS refusing a moved snapshot. */
+// biome-ignore lint/suspicious/noExplicitAny: in-memory rows are untyped fixtures
+function openableData(stores: Record<string, any[]>, tbl: (name: string, pk?: string) => any): DataLayer {
+  const norm = (v: unknown) => v ?? null;
+  const exec = async (sql: string, params: unknown[] = []) => {
+    const flip =
+      /UPDATE "pull_requests" SET "status" = 'converging', "updated_at" = \? WHERE "pr_key" = \? AND "status" = 'escalated' AND "process_key" IS \? AND "updated_at" IS \?/.exec(
+        sql,
+      );
+    if (flip) {
+      const [at, prKey, processKey, updatedAt] = params;
+      const row = (stores.pull_requests ?? []).find((r) => r.pr_key === prKey);
+      if (row && row.status === "escalated" && norm(row.process_key) === norm(processKey) && norm(row.updated_at) === norm(updatedAt)) {
+        row.status = "converging";
+        row.updated_at = at;
+        return { changed: 1 };
+      }
+      return { changed: 0 };
+    }
+    const retire = /UPDATE "escalations" SET "status" = 'stale' WHERE "id" = \? AND "status" = 'open'/.exec(sql);
+    if (retire) {
+      const row = (stores.escalations ?? []).find((r) => r.id === params[0]);
+      if (row && row.status === "open") {
+        row.status = "stale";
+        return { changed: 1 };
+      }
+      return { changed: 0 };
+    }
+    throw new Error(`unexpected exec sql: ${sql}`);
+  };
+  const source: any = {
+    exec,
+    table: (n: string, pk?: string) => tbl(n, pk),
+    tx: async (fn: (t: any) => Promise<unknown>) => {
+      const snap = JSON.parse(JSON.stringify(stores));
+      try {
+        return await fn(source);
+      } catch (e) {
+        for (const [n, rows] of Object.entries(stores)) {
+          rows.length = 0;
+          rows.push(...(snap[n] ?? []));
+        }
+        throw e;
+      }
+    },
+  };
+  return { table: (n: string, pk?: string) => tbl(n, pk), open: () => source } as unknown as DataLayer;
 }
 
 /** A single engine-reported user task in the fixture. `state` mirrors the engine lifecycle; it
@@ -57,17 +140,43 @@ function memData(seed: Record<string, any[]> = {}): { data: DataLayer; stores: R
  *  A looping instance holds multiple tasks for one element (COMPLETED from prior rounds + the live one). */
 type FakeTask = { userTaskKey: string; elementId?: string; state?: "CREATED" | "COMPLETED" | "CANCELED"; formKey?: string };
 
+/** A single engine-reported element instance in the fixture — the answer-recording service task the
+ *  escalation self-heal probes for (issue #829). `state` mirrors the engine lifecycle; `"ACTIVE"` is the
+ *  in-flight marker that an answer is being recorded. */
+type FakeElement = { elementId: string; state: string };
+
 /** A fake engine whose user tasks are keyed by processInstanceKey (the only field the poller queries on
  *  for plan / PR instances). It models the real engine's two accessors from ONE fixture so a test
  *  genuinely exercises the lifecycle-state filtering: `searchUserTasks` returns tasks in ANY state
- *  (COMPLETED first, as the live API does — issue #294), while `openUserTasks` pins `state:"CREATED"`. */
-function fakeEngine(byInstance: Record<string, FakeTask[]>): EngineClient {
+ *  (COMPLETED first, as the live API does — issue #294), while `openUserTasks` pins `state:"CREATED"`.
+ *  `searchElementInstances` is fed from an OPTIONAL second fixture (default empty) so the PR escalation
+ *  self-heal can see an ACTIVE answer-recording task (issue #829). `searchProcessInstances` is fed from an
+ *  OPTIONAL third fixture keyed by processInstanceKey: any key NOT listed defaults to reporting the
+ *  instance `ACTIVE` (so existing heal fixtures, which model a genuinely-resumed live loop, stay green); a
+ *  value of `null` models an instance ABSENT from the read model; a string overrides its lifecycle state
+ *  (e.g. `"TERMINATED"`) — the positive-ACTIVE liveness gate the self-heal requires (issue #829). */
+function fakeEngine(
+  byInstance: Record<string, FakeTask[]>,
+  elementsByInstance: Record<string, FakeElement[]> = {},
+  instanceStateByInstance: Record<string, string | null> = {},
+): EngineClient {
   const all = (filter?: { processInstanceKey?: string }) =>
     filter?.processInstanceKey ? (byInstance[filter.processInstanceKey] ?? []) : [];
   return {
     searchUserTasks: (filter?: { processInstanceKey?: string }) => Promise.resolve(all(filter)),
     openUserTasks: (filter?: { processInstanceKey?: string }) =>
       Promise.resolve(all(filter).filter((t) => (t.state ?? "CREATED") === "CREATED")),
+    searchElementInstances: (filter?: { processInstanceKey?: string }) =>
+      Promise.resolve(filter?.processInstanceKey ? (elementsByInstance[filter.processInstanceKey] ?? []) : []),
+    searchProcessInstances: (filter?: { processInstanceKeys?: string[] }) =>
+      Promise.resolve(
+        (filter?.processInstanceKeys ?? [])
+          .map((k) => {
+            const state = k in instanceStateByInstance ? instanceStateByInstance[k] : "ACTIVE";
+            return state === null ? null : { processInstanceKey: k, state };
+          })
+          .filter((it): it is { processInstanceKey: string; state: string } => it != null),
+      ),
   } as unknown as EngineClient;
 }
 
@@ -1071,4 +1180,464 @@ test("pollUserTasks (typed-seam fallback): self-heals an escalated run with no o
 
   const byKey = Object.fromEntries((stores.feature_runs ?? []).map((r) => [r.feature_key, r]));
   assertEquals(byKey["o/r#632"].status, "running", "the stranded escalated run is healed to running");
+});
+
+test("pollUserTasks (engine-first): self-heals an escalated PR stranded off its parked task, sparing a genuinely parked one (issue #828)", async () => {
+  // The convergence-path twin of the #642 feature heal. A PR's `status="escalated"` must hold ONLY while
+  // a `wait-answer` / `wait-merge-answer` task is open. A PR whose instance the engine no longer reports
+  // parked (its escalation was answered, but the write-side `answer-escalation` flip was lost around an
+  // app restart — the #828 tear) is reconciled to `converging`; a PR whose task IS still open is left
+  // escalated. The engine's open set is the authority, not the raw `pull_requests.status` column. The
+  // orphaned `open` escalation rows are retired to `stale` so the audit trail matches.
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#828", status: "escalated", process_key: "rp-828", url: "https://github.com/o/r/pull/828", title: "stranded" },
+      { pr_key: "o/r#77", status: "escalated", process_key: "rp-77", url: "https://github.com/o/r/pull/77", title: "still parked" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#828", status: "open", question: "orphaned — never answered", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#77", status: "open", question: "genuinely open", answer: null, answered_at: null },
+    ],
+  });
+  const restore = stubUserTaskSearch([
+    // Only rp-77 is genuinely parked; the engine reports NO open task on rp-828.
+    { userTaskKey: "ut-parked", elementId: "wait-answer", processInstanceKey: "rp-77", state: "CREATED" },
+  ]);
+  try {
+    await pollUserTasks(data, fakeEngine({ "rp-77": [{ userTaskKey: "ut-parked", elementId: "wait-answer" }] }), REST);
+  } finally {
+    restore();
+  }
+
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#828"].status, "converging", "the stranded escalated PR is healed to converging");
+  assertEquals(byKey["o/r#77"].status, "escalated", "the genuinely parked PR stays escalated");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "stale", "the healed PR's orphaned open escalation row is retired to stale");
+  assertEquals(escById[2].status, "open", "the genuinely parked PR's escalation row stays open");
+});
+
+test("pollUserTasks (engine-first): self-heals an escalated MERGE-loop PR off its parked wait-merge-answer task (issue #828)", async () => {
+  // Both loops write `pr.persist-escalation` (`status="escalated"`) and are answered by the same
+  // `answer-escalation` flip, so the heal must confirm against BOTH PR escalation elements — a merge
+  // escalation parks on `wait-merge-answer`.
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#828m", status: "escalated", process_key: "mp-828", url: "https://github.com/o/r/pull/828", title: "stranded merge" },
+    ],
+    escalations: [{ id: 1, pr_key: "o/r#828m", status: "open", question: "not mergeable", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([]); // engine reports NO open task on mp-828
+  const engine = fakeEngine({ "mp-828": [] });
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#828m"].status, "converging", "the stranded escalated merge-loop PR is healed to converging");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR while its answer-recording job is in flight (issue #829)", async () => {
+  // The dangerous race: both BPMN models flow the completed `wait-answer` / `wait-merge-answer` user task
+  // DIRECTLY to the `record-answer` / `record-merge-answer` service task (`pr.answer-escalation`). Between
+  // the operator completing the task and that job running, the user task is already gone (openUserTasks
+  // returns none) yet the answer is being recorded RIGHT NOW. The escalation can be arbitrarily old (past
+  // the raise-time grace), so the grace window does not cover this. Healing here would flip the row to
+  // `converging` and retire the still-`open` escalation to `stale`, and the in-flight worker would then
+  // find no target and silently drop the operator's answer. An ACTIVE answer-recording element instance is
+  // positive evidence the answer is in flight, so the heal must skip it — exactly like an open task.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829r", status: "escalated", process_key: "rp-829r", updated_at: stale, url: "https://github.com/o/r/pull/829", title: "answer in flight (review)" },
+      { pr_key: "o/r#829m", status: "escalated", process_key: "rp-829m", updated_at: stale, url: "https://github.com/o/r/pull/8290", title: "answer in flight (merge)" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#829r", status: "open", question: "answered, recording", answer: "do it", answered_at: stale },
+      { id: 2, pr_key: "o/r#829m", status: "open", question: "answered, recording", answer: "rebase", answered_at: stale },
+    ],
+  });
+  const restore = stubUserTaskSearch([]); // the user task has already completed on both instances
+  // Each instance's answer-recording service task is ACTIVE — the operator's answer is being written.
+  const engine = fakeEngine(
+    { "rp-829r": [], "rp-829m": [] },
+    {
+      "rp-829r": [{ elementId: "record-answer", state: "ACTIVE" }],
+      "rp-829m": [{ elementId: "record-merge-answer", state: "ACTIVE" }],
+    },
+  );
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829r"].status, "escalated", "a PR with an in-flight review answer-recorder is spared the heal");
+  assertEquals(byKey["o/r#829m"].status, "escalated", "a PR with an in-flight merge answer-recorder is spared the heal");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the in-flight review escalation row is left for the worker to answer");
+  assertEquals(escById[2].status, "open", "the in-flight merge escalation row is left for the worker to answer");
+});
+
+test("pollUserTasks (engine-first): DOES heal an escalated PR once its answer-recorder has completed (issue #829)", async () => {
+  // The genuine #828 lost-write tear: the answer-recording job COMPLETED (its element instance is no
+  // longer ACTIVE) but the durable `status="converging"` flip was lost around an app restart. With no open
+  // task AND no ACTIVE answer-recorder, the PR is genuinely stranded and must heal — the in-flight guard
+  // must not over-fire and wedge it permanently.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [{ pr_key: "o/r#829c", status: "escalated", process_key: "rp-829c", updated_at: stale, url: "https://github.com/o/r/pull/8291", title: "recorder completed, write lost" }],
+    escalations: [{ id: 1, pr_key: "o/r#829c", status: "open", question: "orphaned", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([]);
+  const engine = fakeEngine({ "rp-829c": [] }, { "rp-829c": [{ elementId: "record-answer", state: "COMPLETED" }] });
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829c"].status, "converging", "a stranded PR whose answer-recorder already completed is healed");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "stale", "the orphaned open escalation row is retired to stale");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR whose process instance is TERMINAL (issue #829)", async () => {
+  // Copilot review of the #828 heal: "no open task and no ACTIVE escalation element" is ALSO true for a
+  // TERMINAL instance (cancelled / completed / failed), whose loop never resumed. Flipping such a frozen
+  // `escalated` row to `converging` and retiring its audit rows fabricates a live loop the engine will
+  // never advance; terminal PRs are owned by tracking/reconciliation (they read `abandoned`/settled on
+  // `derived_status`). The heal now requires POSITIVE engine-truth that the instance is `ACTIVE`, so a
+  // TERMINATED (and, below, an absent) instance is spared. One case per known terminal state.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829tt", status: "escalated", process_key: "rp-829tt", updated_at: stale, url: "https://github.com/o/r/pull/8297", title: "terminated instance" },
+      { pr_key: "o/r#829tc", status: "escalated", process_key: "rp-829tc", updated_at: stale, url: "https://github.com/o/r/pull/8298", title: "cancelled instance" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#829tt", status: "open", question: "loop gone", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#829tc", status: "open", question: "loop gone", answer: null, answered_at: null },
+    ],
+  });
+  const restore = stubUserTaskSearch([]); // no open task — but the loop is dead, not merely mid-transition
+  // No open task, no ACTIVE escalation element, but the instance itself is a known terminal state.
+  const engine = fakeEngine(
+    { "rp-829tt": [], "rp-829tc": [] },
+    {},
+    { "rp-829tt": "TERMINATED", "rp-829tc": "CANCELED" },
+  );
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829tt"].status, "escalated", "a TERMINATED instance is left to tracking/reconciliation, not healed");
+  assertEquals(byKey["o/r#829tc"].status, "escalated", "a CANCELED instance is left to tracking/reconciliation, not healed");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the terminal instance's escalation row is not retired");
+  assertEquals(escById[2].status, "open", "the cancelled instance's escalation row is not retired");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR whose process instance is ABSENT / unknown-state (issue #829)", async () => {
+  // The other halves of the tri-state (Copilot review of #828): an instance genuinely ABSENT from the
+  // read model (engine answered, no match) is treated like a terminal — its loop is gone, so leave it to
+  // tracking rather than fabricate a resumed loop. An instance present with an UNKNOWN/empty `state` is a
+  // partial read this app cannot interpret and is SPARED (never healed off a wire shape we misread). Both
+  // stay `escalated`. One case each.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829ab", status: "escalated", process_key: "rp-829ab", updated_at: stale, url: "https://github.com/o/r/pull/8299", title: "absent instance" },
+      { pr_key: "o/r#829uk", status: "escalated", process_key: "rp-829uk", updated_at: stale, url: "https://github.com/o/r/pull/82990", title: "unknown-state instance" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#829ab", status: "open", question: "loop gone", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#829uk", status: "open", question: "partial read", answer: null, answered_at: null },
+    ],
+  });
+  const restore = stubUserTaskSearch([]);
+  // `null` models an instance absent from the read model; a blank string models an unknown/partial state.
+  const engine = fakeEngine({ "rp-829ab": [], "rp-829uk": [] }, {}, { "rp-829ab": null, "rp-829uk": "" });
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829ab"].status, "escalated", "an ABSENT instance is left to tracking/reconciliation, not healed");
+  assertEquals(byKey["o/r#829uk"].status, "escalated", "an UNKNOWN-state instance is spared, not healed off a misread wire shape");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the absent instance's escalation row is not retired");
+  assertEquals(escById[2].status, "open", "the unknown-state instance's escalation row is not retired");
+});
+
+test("pollUserTasks (engine-first): a terminated-while-escalated PR is EXCLUDED by the derived tracking VIEW — never probed (issue #829)", async () => {
+  // Copilot review of #829: the candidate scan reads through `prsTracking` and requires
+  // `derived_status="escalated"`, so a PR TERMINATED while its base status was `escalated` — whose VIEW
+  // folds `derived_status` to `abandoned` — is excluded BEFORE any per-instance probe. Without the VIEW
+  // filter this historical row would be reselected every poll and burn engine RPCs forever. We seed an
+  // explicit `derived_status: "abandoned"` (the reconciler's terminal fold) and assert the heal issues NO
+  // engine RPC for it at all, and its frozen base row / escalation are left untouched.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829term", status: "escalated", derived_status: "abandoned", process_key: "rp-829term", updated_at: stale, url: "https://github.com/o/r/pull/82991", title: "terminated-while-escalated (VIEW-folded)" },
+    ],
+    escalations: [{ id: 1, pr_key: "o/r#829term", status: "open", question: "loop gone", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([]);
+  const probed: string[] = [];
+  const engine = {
+    searchUserTasks: () => Promise.resolve([]),
+    openUserTasks: (f?: { processInstanceKey?: string }) => {
+      if (f?.processInstanceKey) probed.push(f.processInstanceKey);
+      return Promise.resolve([]);
+    },
+    searchElementInstances: (f?: { processInstanceKey?: string }) => {
+      if (f?.processInstanceKey) probed.push(f.processInstanceKey);
+      return Promise.resolve([]);
+    },
+    searchProcessInstances: (f?: { processInstanceKeys?: string[] }) => {
+      for (const k of f?.processInstanceKeys ?? []) probed.push(k);
+      return Promise.resolve([]);
+    },
+  } as unknown as EngineClient;
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  assertEquals(probed.includes("rp-829term"), false, "a VIEW-folded terminal row is excluded from the scan — no engine RPC is issued for it");
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829term"].status, "escalated", "the terminated row's frozen base status is left to tracking, not rewritten");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the terminated row's escalation is not retired");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR while its persist-escalation producer is still ACTIVE (issue #829)", async () => {
+  // The producer-side twin of the answer-recorder race. `pr.persist-escalation` COMMITS the `open` row and
+  // `status="escalated"` BEFORE the engine creates the `wait-answer` user task, so there is a window with an
+  // `escalated` PR, an `open` escalation, and NO user task yet. The raise-time grace normally covers it, but
+  // if the producer service task stays ACTIVE past the grace (an app restart / lease delay between the DB
+  // commit and the job completing) the row is old enough to heal while the escalation is being raised RIGHT
+  // NOW. Healing here would retire the just-raised escalation to `stale` and the question would never surface.
+  // An ACTIVE persist-escalation element is positive evidence, so the heal must skip it — one case per loop.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829pr", status: "escalated", process_key: "rp-829pr", updated_at: stale, url: "https://github.com/o/r/pull/8293", title: "producer active (review)" },
+      { pr_key: "o/r#829pm", status: "escalated", process_key: "rp-829pm", updated_at: stale, url: "https://github.com/o/r/pull/8294", title: "producer active (merge)" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#829pr", status: "open", question: "being raised", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#829pm", status: "open", question: "being raised", answer: null, answered_at: null },
+    ],
+  });
+  const restore = stubUserTaskSearch([]); // the user task does not exist yet — the producer hasn't completed
+  const engine = fakeEngine(
+    { "rp-829pr": [], "rp-829pm": [] },
+    {
+      "rp-829pr": [{ elementId: "persist-escalation-blockedcomments", state: "ACTIVE" }],
+      "rp-829pm": [{ elementId: "merge-esc-conflict", state: "ACTIVE" }],
+    },
+  );
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829pr"].status, "escalated", "a PR with an ACTIVE review persist-escalation producer is spared the heal");
+  assertEquals(byKey["o/r#829pm"].status, "escalated", "a PR with an ACTIVE merge persist-escalation producer is spared the heal");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the just-raised review escalation row is left open");
+  assertEquals(escById[2].status, "open", "the just-raised merge escalation row is left open");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR when the producer→user-task transition lands BETWEEN the two engine reads (issue #829)", async () => {
+  // The producer→user-task TOCTOU the prior two guards miss. `openUserTasks()` (read 1) returns empty while
+  // a long-running persist producer is still ACTIVE; that producer then COMPLETES and the engine creates the
+  // `wait-answer` / `wait-merge-answer` user task BEFORE `searchElementInstances()` (read 2). Read 2 therefore
+  // sees an ACTIVE wait element — NOT the producer. Because user-task creation does not re-stamp the PR row's
+  // `updated_at` (only `pr.persist-escalation` does, before the task exists), the row is past the raise-time
+  // grace, so neither the grace nor the producer/answer-recorder predicate covers it: a predicate that ignores
+  // the wait elements lets the CAS win and stale a live escalation. Treat an ACTIVE `wait-answer` /
+  // `wait-merge-answer` element as positive evidence in the second snapshot too — one case per loop.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#829wr", status: "escalated", process_key: "rp-829wr", updated_at: stale, url: "https://github.com/o/r/pull/8295", title: "producer→wait (review)" },
+      { pr_key: "o/r#829wm", status: "escalated", process_key: "rp-829wm", updated_at: stale, url: "https://github.com/o/r/pull/8296", title: "producer→wait (merge)" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#829wr", status: "open", question: "raised mid-read", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#829wm", status: "open", question: "raised mid-read", answer: null, answered_at: null },
+    ],
+  });
+  // The typed `openUserTasks` seam reports NO open task (the producer was still ACTIVE at read 1), while the
+  // element search (read 2) now sees the freshly-created wait element ACTIVE — the transition landed mid-read.
+  const restore = stubUserTaskSearch([]);
+  const engine = fakeEngine(
+    { "rp-829wr": [], "rp-829wm": [] },
+    {
+      "rp-829wr": [{ elementId: "wait-answer", state: "ACTIVE" }],
+      "rp-829wm": [{ elementId: "wait-merge-answer", state: "ACTIVE" }],
+    },
+  );
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829wr"].status, "escalated", "a PR whose wait-answer appeared mid-read is spared the heal");
+  assertEquals(byKey["o/r#829wm"].status, "escalated", "a PR whose wait-merge-answer appeared mid-read is spared the heal");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the live review escalation row is left open");
+  assertEquals(escById[2].status, "open", "the live merge escalation row is left open");
+});
+
+test("pollUserTasks (engine-first): a re-escalation in the read→write window is NOT clobbered — the guarded CAS refuses the moved snapshot (issue #829)", async () => {
+  // The TOCTOU race Copilot flagged: the heal reads the PR, then does two remote engine RPCs, THEN writes.
+  // If the SAME instance re-escalates in that window (`pr.persist-escalation` re-stamps `updated_at` and
+  // INSERTs a fresh open escalation), a blind write would clobber the fresh `escalated` status and stale
+  // the fresh escalation — dropping the operator's next answer. We reproduce the concurrent re-escalation
+  // by mutating the store from inside `searchElementInstances` (the last read before the write), then
+  // assert the snapshot-fenced CAS makes NO change: the PR stays `escalated` and the fresh escalation open.
+  // NB the mutation advances `updated_at` AND inserts the fresh escalation TOGETHER, modelling the now-atomic
+  // `pr.persist-escalation` producer (its insert + PR re-stamp share one transaction, issue #829) — so a
+  // captured snapshot can never see the new escalation under the OLD generation; the covering red/green for
+  // that producer atomicity lives in app/persist-escalation.test.ts.
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [{ pr_key: "o/r#829race", status: "escalated", process_key: "rp-829race", updated_at: stale, url: "https://github.com/o/r/pull/8292", title: "re-escalates mid-heal" }],
+    escalations: [{ id: 1, pr_key: "o/r#829race", status: "open", question: "first", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([]);
+  let reEscalated = false;
+  const engine = {
+    searchUserTasks: () => Promise.resolve([]),
+    openUserTasks: () => Promise.resolve([]),
+    // Report the instance ACTIVE so the heal reaches its guarded CAS (Copilot review of #829): without a
+    // `searchProcessInstances` response the positive-liveness probe throws, sets `queryErrored`, and the
+    // row would be spared for the WRONG reason — never exercising the snapshot-fenced CAS this test asserts.
+    searchProcessInstances: () => Promise.resolve([{ processInstanceKey: "rp-829race", state: "ACTIVE" }]),
+    searchElementInstances: (filter?: { processInstanceKey?: string }) => {
+      // Simulate the concurrent re-escalation landing AFTER the heal captured its snapshot but BEFORE its
+      // write: the row's generation advances (`updated_at`) and a brand-new open escalation is inserted.
+      if (filter?.processInstanceKey === "rp-829race" && !reEscalated) {
+        reEscalated = true;
+        const row = (stores.pull_requests ?? []).find((r) => r.pr_key === "o/r#829race");
+        if (row) row.updated_at = new Date().toISOString();
+        (stores.escalations ?? []).push({ id: 2, pr_key: "o/r#829race", status: "open", question: "second", answer: null, answered_at: null });
+      }
+      return Promise.resolve([{ elementId: "record-answer", state: "COMPLETED" }]);
+    },
+  } as unknown as EngineClient;
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#829race"].status, "escalated", "the re-escalated PR is left escalated — the CAS refused the moved snapshot");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[2].status, "open", "the fresh escalation opened in the window is NOT retired");
+  assertEquals(escById[1].status, "open", "the snapshot's own escalation is left untouched too — the whole tx rolled to a no-op");
+});
+
+test("pollUserTasks (engine-first): skips the per-instance open-task RPC for an escalated PR already seen parked in this pass's sweep (issue #828)", async () => {
+  // best-effort sweep may truncate (drop tasks) but never invents one. Re-confirming with a per-instance
+  // `openUserTasks` RPC is a redundant N+1 query; the self-heal must skip it. Only a PR NOT confirmed
+  // parked by the sweep still needs the per-instance check.
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#parked", status: "escalated", process_key: "rp-parked", url: "https://github.com/o/r/pull/1", title: "parked" },
+      { pr_key: "o/r#stranded", status: "escalated", process_key: "rp-stranded", url: "https://github.com/o/r/pull/2", title: "stranded" },
+    ],
+    escalations: [{ id: 1, pr_key: "o/r#parked", status: "open", question: "open", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([
+    { userTaskKey: "ut-parked", elementId: "wait-answer", processInstanceKey: "rp-parked", state: "CREATED" },
+  ]);
+  const openUserTasksCalls: string[] = [];
+  const engine = {
+    searchUserTasks: () => Promise.resolve([]),
+    openUserTasks: (filter?: { processInstanceKey?: string }) => {
+      if (filter?.processInstanceKey) openUserTasksCalls.push(filter.processInstanceKey);
+      return Promise.resolve([]);
+    },
+    searchElementInstances: () => Promise.resolve([]),
+    // The stranded instance genuinely resumed (ACTIVE) — so the sweep-miss falls through to the
+    // per-instance confirm AND the positive-liveness gate, and heals (issue #829).
+    searchProcessInstances: (filter?: { processInstanceKeys?: string[] }) =>
+      Promise.resolve((filter?.processInstanceKeys ?? []).map((k) => ({ processInstanceKey: k, state: "ACTIVE" }))),
+  } as unknown as EngineClient;
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#parked"].status, "escalated", "the swept-parked PR stays escalated without a per-instance query");
+  assertEquals(byKey["o/r#stranded"].status, "converging", "the PR absent from the sweep is still confirmed per-instance and healed");
+  assertEquals(openUserTasksCalls.includes("rp-parked"), false, "no redundant per-instance RPC for the already-parked PR");
+  assertEquals(openUserTasksCalls.includes("rp-stranded"), true, "the unconfirmed PR still needs the per-instance RPC");
+});
+
+test("pollUserTasks (engine-first): does NOT heal an escalated PR when the per-instance open-task query errors (issue #828)", async () => {
+  // A per-instance query error is not proof the PR is unparked — mutating on that negative evidence would
+  // steal a parked escalation. On query error the PR must be left `escalated` for a later pass.
+  const { data, stores } = memData({
+    pull_requests: [{ pr_key: "o/r#err", status: "escalated", process_key: "rp-err", url: "https://github.com/o/r/pull/9", title: "query errors" }],
+    escalations: [{ id: 1, pr_key: "o/r#err", status: "open", question: "open", answer: null, answered_at: null }],
+  });
+  const restore = stubUserTaskSearch([]);
+  const engine = {
+    searchUserTasks: () => Promise.resolve([]),
+    openUserTasks: (filter?: { processInstanceKey?: string }) =>
+      filter?.processInstanceKey === "rp-err" ? Promise.reject(new Error("engine down")) : Promise.resolve([]),
+    searchElementInstances: () => Promise.resolve([]),
+  } as unknown as EngineClient;
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#err"].status, "escalated", "a failed per-instance query leaves the PR escalated");
+  const escById = Object.fromEntries((stores.escalations ?? []).map((r) => [r.id, r]));
+  assertEquals(escById[1].status, "open", "the escalation row is untouched when the heal is skipped");
+});
+
+test("pollUserTasks (engine-first): does NOT heal a JUST-escalated PR inside the grace window before its user task exists (issue #828)", async () => {
+  // `pr.persist-escalation` stamps `status="escalated"` (and `updated_at`) IMMEDIATELY BEFORE the engine
+  // creates the `wait-answer` user task. A poll landing in that window sees `openUserTasks` return none
+  // and would wrongly flip the fresh escalation back to `converging`. A short grace window on `updated_at`
+  // spares a just-written escalation while still healing genuinely-stranded (old) rows.
+  const fresh = new Date().toISOString();
+  const stale = new Date(Date.now() - 60 * 60_000).toISOString();
+  const { data, stores } = memData({
+    pull_requests: [
+      { pr_key: "o/r#fresh", status: "escalated", process_key: "rp-fresh", updated_at: fresh, url: "https://github.com/o/r/pull/3", title: "just escalated" },
+      { pr_key: "o/r#old", status: "escalated", process_key: "rp-old", updated_at: stale, url: "https://github.com/o/r/pull/4", title: "genuinely stranded" },
+    ],
+    escalations: [
+      { id: 1, pr_key: "o/r#fresh", status: "open", question: "fresh", answer: null, answered_at: null },
+      { id: 2, pr_key: "o/r#old", status: "open", question: "old", answer: null, answered_at: null },
+    ],
+  });
+  const restore = stubUserTaskSearch([]);
+  const engine = fakeEngine({});
+  try {
+    await pollUserTasks(data, engine, REST);
+  } finally {
+    restore();
+  }
+  const byKey = Object.fromEntries((stores.pull_requests ?? []).map((r) => [r.pr_key, r]));
+  assertEquals(byKey["o/r#fresh"].status, "escalated", "a just-escalated PR inside the grace window is spared the heal");
+  assertEquals(byKey["o/r#old"].status, "converging", "a genuinely-stranded (old) PR is still healed");
 });
