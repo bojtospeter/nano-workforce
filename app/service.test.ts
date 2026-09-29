@@ -876,6 +876,21 @@ test("submitPr seeds the #796 auto-ack budget onto the instance (ackRetryRound=0
   });
 });
 
+test("submitPr seeds humanApproval (issue #826), pinned off for a converge-only run that never merges", async () => {
+  await withGithubOff(async () => {
+    const pr = (n: number) => ({ repo: "owner/repo", number: n, url: `https://github.com/owner/repo/pull/${n}`, prKey: `owner/repo#${n}` });
+    const merging = captureVars();
+    await submitPr(merging.data, merging.engine, pr(11), [], 20, false, null, true);
+    assertEquals(merging.get()?.humanApproval, true);
+    const convergeOnly = captureVars();
+    await submitPr(convergeOnly.data, convergeOnly.engine, pr(12), [], 20, true, null, true);
+    assertEquals(convergeOnly.get()?.humanApproval, false);
+    const unset = captureVars();
+    await submitPr(unset.data, unset.engine, pr(13));
+    assertEquals(unset.get()?.humanApproval, false);
+  });
+});
+
 // Lineage threading (issue #245): `submitPr` persists the origin `root_request_key` on the PR row
 // and carries it onto the convergence instance; `startMerge` reads it back off the row onto the
 // merge instance. A human/webhook submit that supplies no root self-roots on the `pr_key` (its own

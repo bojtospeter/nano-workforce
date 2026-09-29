@@ -290,6 +290,11 @@ A single submission can choose its merge behavior explicitly with the positive
 `converged` regardless of the global default, while `true` enables the merge-loop
 after convergence only when `NANO_PR_AUTO_MERGE` is enabled.
 
+A feature run started with `humanApproval` (with `autoMerge`) adds a human gate: the
+converged PR waits in the Tasks inbox as "PR merge approval". Approve it to merge, or
+request changes with guidance. The agent then updates the same PR, convergence re-runs,
+and approval is asked again.
+
 ### Fleet mode: hand it an issue (plan → implement → converge)
 
 ```

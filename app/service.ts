@@ -104,9 +104,11 @@ import {
   latestOpenEscalationQuestion,
   latestPlanReviewFindings,
   latestTrialMergeQuestion,
+  MERGE_APPROVAL_QUESTION,
   type OpenEscalation,
   PLAN_REVIEW_ELEMENT,
   PR_ESCALATION_PRODUCER_ELEMENTS,
+  PR_MERGE_APPROVAL_ELEMENT,
   PR_RECORD_ANSWER_ELEMENT,
   PR_RECORD_MERGE_ANSWER_ELEMENT,
   PR_WAIT_ANSWER_ELEMENT,
@@ -573,9 +575,10 @@ export async function submitPr(
   maxRounds: number = MAX_ROUNDS,
   convergeOnly = false,
   rootRequestKey: string | null = null,
+  humanApproval = false,
 ) {
   return withPrSubmitLock(parsed.prKey, () =>
-    submitPrCritical(data, engine, parsed, dependsOn, maxRounds, convergeOnly, rootRequestKey),
+    submitPrCritical(data, engine, parsed, dependsOn, maxRounds, convergeOnly, rootRequestKey, humanApproval),
   );
 }
 
@@ -587,6 +590,7 @@ async function submitPrCritical(
   maxRounds: number = MAX_ROUNDS,
   convergeOnly = false,
   rootRequestKey: string | null = null,
+  humanApproval = false,
 ) {
   const table = prs(data);
   const existing = await table.get(parsed.prKey);
@@ -724,6 +728,9 @@ async function submitPrCritical(
       // `converged` for this PR without handing off to the merge-loop, independent of the global
       // NANO_PR_AUTO_MERGE default. Only ever narrows (never forces merge on when auto-merge is off).
       convergeOnly,
+      // Human approval before merge (issue #826): a converged PR parks at the `merge-approval` user
+      // task before `pr.finalize` hands it to the merge-loop. Moot for a converge-only run (no merge).
+      humanApproval: humanApproval && !convergeOnly,
       // Cooperative abandon check (#76): the capability URL + the abort brief appended to the
       // review-round agent's prompt, so it can stop before pushing if the run is cancelled.
       abandonUrl: abUrl,
@@ -2469,13 +2476,24 @@ export async function pollFeatureDelivery(
       //       it would wedge `converging` forever with no PR process.
       // Both heal via the SAME idempotent `submitPr`: it is idempotent on the PR key (a redundant call
       // on an already-live PR early-returns `alreadyRunning`), and now treats a keyless non-terminal row
-      // as resubmittable, so it re-creates the instance and installs `process_key`. `convergeOnly`
-      // mirrors `converge-feature` — the inverse of the run's `auto_merge` flag.
+      // as resubmittable, so it re-creates the instance and installs `process_key`. `convergeOnly` and
+      // `humanApproval` mirror `converge-feature` — derived from the run's `auto_merge`/`human_approval`.
       const partiallyEnrolled =
         trackedPr != null && trackedPr.process_key == null && !TERMINAL_STATUSES.includes(trackedPr.derived_status);
       if (prStatus === null || partiallyEnrolled) {
         const parsed = parsePr(run.pr_key);
-        if (parsed) await submitPr(data, engine, parsed, [], MAX_ROUNDS, run.auto_merge !== 1, run.feature_key);
+        if (parsed) {
+          await submitPr(
+            data,
+            engine,
+            parsed,
+            [],
+            MAX_ROUNDS,
+            run.auto_merge !== 1,
+            run.feature_key,
+            run.human_approval === 1,
+          );
+        }
       }
       const { status, label } = deriveFeatureDelivery(prStatus);
       if (run.status !== status || run.delivery_label !== label) {
@@ -3057,6 +3075,7 @@ export async function pollUserTasks(
     [READINESS_ESCALATION_ELEMENT]: "plan",
     [PR_WAIT_ANSWER_ELEMENT]: "pr",
     [PR_WAIT_MERGE_ANSWER_ELEMENT]: "pr",
+    [PR_MERGE_APPROVAL_ELEMENT]: "pr",
   };
 
   // The SINGLE enrichment derivation both discovery paths feed: resolve one open escalation task (by
@@ -3108,6 +3127,9 @@ export async function pollUserTasks(
       case PR_WAIT_ANSWER_ELEMENT:
       case PR_WAIT_MERGE_ANSWER_ELEMENT:
         question = latestOpenEscalationQuestion(await prEscalations(data).find({ pr_key: subjectKey, status: "open" }));
+        break;
+      case PR_MERGE_APPROVAL_ELEMENT:
+        question = MERGE_APPROVAL_QUESTION;
         break;
       case CONFORMANCE_ESCALATION_ELEMENT:
         question = conformanceEscalationQuestion(subj ? { summary: subj.conformanceSummary } : undefined);

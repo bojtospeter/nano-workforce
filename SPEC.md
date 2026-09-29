@@ -101,7 +101,7 @@ known at submit time, carried as a process variable and stored on the DB row.
 │    <gateway: status>
 │      ├── converged  → [Check review comments] (pr.converge-gate; ++ackRetryRound on ack-only block)
 │      │                   → <gateway: comments addressed?>
-│      │                       ├── addressed → [Scope classifier] → … → [Mark converged] → (end)
+│      │                       ├── addressed → [Scope classifier] → … → <human approval?> → [Mark converged] → (end)
 │      │                       ├── review stale (#799) → [Record round] (re-solicit fresh review) ┐
 │      │                       └── unaddressed → <gateway: auto-ack within budget?>               │
 │      │                            ├── convergeAckOnly and ackRetryRound ≤ ackRetryMax           │
@@ -154,6 +154,18 @@ escalates, resolution failure fails open to the human, and re-submitting the PR
 (`submitPr`) invalidates its adjudications so a fresh run re-decides. Only the convergence
 loop feeds and reads this memory — a merge-loop answer (same `pr.answer-escalation` step)
 is tagged `answerContext = "merge"` and never recorded as a convergence adjudication.
+
+**Human approval before merge (issue #826).** A feature run started with `humanApproval`
+(only meaningful with `autoMerge`) seeds `humanApproval = true` on its convergence instance.
+After the scope gate passes, the `human approval?` gateway then parks the converged PR on the
+native `merge-approval` user task (`merge-approval.form`, surfaced in the Tasks inbox as
+"PR merge approval") instead of going straight to `[Mark converged]`. `mergeDecision = "approve"`
+continues to `pr.finalize`, which hands the PR to the merge-loop. Anything else (the form's
+`revise` plus required guidance) loops back to `capture-head` with the guidance as `answer`, so
+the review agent updates the **same** PR. Convergence then re-runs and approval is asked again.
+The default route is fail-closed: nothing merges without an explicit approval. The task is
+human-only (never agent-answerable) and never auto-resumed from an adjudication. Without the
+flag the gateway defaults straight through, so existing runs are unchanged.
 
 Guard: after progress classification, a **progressing** round with round ≥
 MAX_ROUNDS forces an escalation ("not converged after N rounds") so a human
