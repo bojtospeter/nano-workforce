@@ -161,7 +161,9 @@ seeds `humanApproval = true` on its convergence instance — only when the PR wo
 After the scope gate passes, the `human approval?` gateway then parks the converged PR on the
 native `merge-approval` user task (`merge-approval.form`, surfaced in the Tasks inbox as
 "PR merge approval") instead of going straight to `[Mark converged]`. `mergeDecision = "approve"`
-continues to `pr.finalize`, which hands the PR to the merge-loop. Anything else (the form's
+continues to `pr.finalize`, which hands the PR to the merge-loop. Approval covers the PR, not a
+pinned SHA: as with any auto-merge, the merge-loop may still rebase it or fix CI before landing.
+Anything else (the form's
 `revise` plus required guidance) loops back to `capture-head` with the guidance as `answer`, so
 the review agent updates the **same** PR. Convergence then re-runs and approval is asked again.
 The default route is fail-closed: once parked, nothing merges without an explicit approval. A

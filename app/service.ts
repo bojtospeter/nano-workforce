@@ -617,8 +617,10 @@ async function submitPrCritical(
     // Human approval is monotonic (issue #826): a gated caller adopting a live loop — possibly an
     // ungated one another run started — narrows it to gated instead of inheriting its auto-merge.
     // Idempotent, so a retry against our own gated loop is a no-op. A loop the engine no longer reports
-    // running is left alone; one already past its `human approval?` gateway can no longer be gated.
-    if (gated) {
+    // running is left alone; one already past its `human approval?` gateway can no longer be gated. A
+    // finalized PR (`converged_at` set) is past it: `startMerge` re-pointed its `process_key` at the
+    // merge-loop, which must not be written to.
+    if (gated && existing.converged_at == null) {
       const loopKey = existing.process_key;
       const match = (await engine.searchProcessInstances({ processInstanceKeys: [loopKey] })).find(
         (s) => String(s.processInstanceKey) === loopKey,

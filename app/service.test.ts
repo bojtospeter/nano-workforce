@@ -894,11 +894,24 @@ test("submitPr seeds humanApproval (issue #826), pinned off for a converge-only 
 // Adoption (issue #826, Copilot review): `submitPr` returns `alreadyRunning` for a PR whose loop is
 // live, so a gated caller adopting an UNGATED loop would inherit its auto-merge. `humanApproval` is
 // monotonic: the gated caller narrows the live loop (idempotent, so a retry against its own gated loop
-// is a no-op). A loop already past convergence (merge stage, instance COMPLETED) can't be re-gated.
-function adoptLoop(status: string, loopState: string) {
+// is a no-op). A PR already finalized (`converged_at` set) is past its approval point: `startMerge`
+// re-pointed its `process_key` at the LIVE merge-loop, which must never be written to.
+function adoptLoop(status: string, loopState: string, convergedAt: string | null = null) {
   const stores: Record<string, { rows: unknown[]; key: string }> = {
     pull_requests: {
-      rows: [{ pr_key: "owner/repo#14", repo: "owner/repo", number: 14, url: "https://github.com/owner/repo/pull/14", title: "t", status, current_round: 1, process_key: "PI-LOOP" }],
+      rows: [
+        {
+          pr_key: "owner/repo#14",
+          repo: "owner/repo",
+          number: 14,
+          url: "https://github.com/owner/repo/pull/14",
+          title: "t",
+          status,
+          current_round: 1,
+          process_key: "PI-LOOP",
+          converged_at: convergedAt,
+        },
+      ],
       key: "pr_key",
     },
     escalations: { rows: [], key: "id" },
@@ -935,9 +948,13 @@ test("a gated submitPr adopting a live loop narrows it to humanApproval (issue #
     await submitPr(convergeOnly.data, convergeOnly.engine, pr, [], 20, true, null, true);
     assertEquals(convergeOnly.narrowed, [], "a converge-only adopter never merges, so never gates");
 
-    const merging = adoptLoop("waiting_deps", "COMPLETED");
+    const merging = adoptLoop("waiting_deps", "ACTIVE", "2026-01-01T00:00:00.000Z");
     assertEquals(await submitPr(merging.data, merging.engine, pr, [], 20, false, null, true), { prKey: pr.prKey, alreadyRunning: true });
-    assertEquals(merging.narrowed, [], "a loop already past convergence is not touched");
+    assertEquals(merging.narrowed, [], "the live merge-loop of a finalized PR is never written to");
+
+    const ended = adoptLoop("converging", "COMPLETED");
+    await submitPr(ended.data, ended.engine, pr, [], 20, false, null, true);
+    assertEquals(ended.narrowed, [], "a loop the engine no longer reports running is left alone");
   });
 });
 
