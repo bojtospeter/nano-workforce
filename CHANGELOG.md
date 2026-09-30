@@ -1,3 +1,9 @@
+## [0.194.0](https://github.com/nanobpm/nano-workforce/compare/v0.193.2...v0.194.0) (2026-09-30)
+
+### Features
+
+* **cockpit:** collapse agent-history turns behind a timestamped heading ([#832](https://github.com/nanobpm/nano-workforce/issues/832)) ([812907d](https://github.com/nanobpm/nano-workforce/commit/812907d13c49dc8a008bb8682d7d58f04c8ba323)), closes [#831](https://github.com/nanobpm/nano-workforce/issues/831)
+
 ## [0.193.2](https://github.com/nanobpm/nano-workforce/compare/v0.193.1...v0.193.2) (2026-09-29)
 
 ### Bug Fixes
