@@ -63,6 +63,10 @@ export interface AgentTurnView {
   readonly toolCalls: readonly AgentTurnToolCallView[];
   /** A compact per-turn token/duration rollup, when metrics exist. */
   readonly metrics?: string;
+  /** When the turn was produced (ISO-8601), when the engine reports it. */
+  readonly producedAt?: string;
+  /** The turn's compact heading timestamp (`HH:MM:SS`, UTC), when `producedAt` parses. */
+  readonly time?: string;
 }
 
 /** The full renderable history for one agent instance: its rolled-up header + ordered turns. */
@@ -113,6 +117,16 @@ function turnMetrics(r: AgentHistoryRecord): string | undefined {
   return dur !== undefined ? `${base} \u00b7 ${dur}` : base;
 }
 
+/** A compact `HH:MM:SS` heading timestamp in UTC for an ISO instant; undefined when unparseable. */
+export function turnTime(iso: string | undefined): string | undefined {
+  if (iso === undefined || iso === "") return undefined;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return undefined;
+  const d = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
 /** The textual content of a turn: TEXT blocks joined in order (non-textual/empty blocks dropped). */
 function turnText(r: AgentHistoryRecord): string {
   const texts: string[] = [];
@@ -156,6 +170,7 @@ export function agentSessionsView(report: AgentInstanceListReport): AgentSession
 /** Project one engine {@link AgentHistoryRecord} onto a renderable {@link AgentTurnView}. */
 export function agentTurnView(r: AgentHistoryRecord): AgentTurnView {
   const metrics = turnMetrics(r);
+  const time = turnTime(r.producedAt);
   return {
     historyItemKey: r.historyItemKey,
     loopIteration: r.loopIteration,
@@ -167,6 +182,8 @@ export function agentTurnView(r: AgentHistoryRecord): AgentTurnView {
       ...(c.elementId !== undefined && c.elementId !== "" ? { elementId: c.elementId } : {}),
     })),
     ...(metrics !== undefined ? { metrics } : {}),
+    ...(r.producedAt !== undefined && r.producedAt !== "" ? { producedAt: r.producedAt } : {}),
+    ...(time !== undefined ? { time } : {}),
   };
 }
 
